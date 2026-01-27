@@ -206,14 +206,4 @@ void setup() {
 
 void loop() {
   send_samples_usb();
-
-  // Optional: if you want to monitor overflow occasionally (don’t spam)
-  // static uint32_t last_ms = 0;
-  // if (millis() - last_ms > 1000) {
-  //   last_ms = millis();
-  //   uint32_t ov = rb_overflow;
-  //   // Send a tiny ASCII status line once per second (safe)
-  //   SerialUSB.print("ovf=");
-  //   SerialUSB.println(ov);
-  //}
 }
