@@ -1,5 +1,106 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include "registers.h"
+
+
+static inline void dvga_cs_low() { digitalWrite(DVGA_CS_PIN, LOW); }
+static inline void dvga_cs_high() { digitalWrite(DVGA_CS_PIN, HIGH); }
+
+static inline void dvgaI_cs_low() { digitalWrite(DVGAI_CS_PIN, LOW); }
+static inline void dvgaI_cs_high() { digitalWrite(DVGAI_CS_PIN, HIGH); }
+
+static inline void le_low() { digitalWrite(LE, LOW); }
+static inline void le_high() { digitalWrite(LE, HIGH); }
+
+
+void att_write_reg(att_reg_address addr, uint8_t data)
+{
+  SPI.beginTransaction(SPISettings(100000, LSBFIRST, SPI_MODE0));
+  le_low();
+  SPI.transfer(data);
+  SPI.transfer(((uint8_t)addr)<<4); 
+  le_high();
+  le_low();
+  le_high();
+  // Serial.print("reg addr 0x");
+  // Serial.println(((uint8_t)addr)<<4, HEX);
+  // Serial.print("data: 0x");
+  // Serial.println(data, HEX);
+  SPI.endTransaction();
+}
+
+void att_init_serial()
+{
+  digitalWrite(LE, HIGH);  //latch enabled
+  digitalWrite(PBAR, HIGH); 
+}
+
+void att_serial(uint8_t g) 
+{
+  g &= 0x7F; // keep only 7 bits (0..127)
+
+  // Serial.print("Setting gain to: ");
+  // Serial.print(g);
+  // Serial.print(" (binary: ");
+  // for (int8_t i = 6; i >= 0; i--) Serial.print((g >> i) & 1);
+  // Serial.println(")");
+  att_write_reg(att_reg_address::REG_ATTN, g);
+  
+}
+
+void dvga_write_reg(uint8_t data)
+{
+  SPI.beginTransaction(SPISettings(100000, LSBFIRST, SPI_MODE0));
+  dvga_cs_high();
+  delay(10);
+  
+  SPI.transfer(data);
+  SPI.transfer(0x00);
+  dvga_cs_low();
+  // Serial.print("data: 0x");
+  // Serial.println(data, HEX);
+  SPI.endTransaction();
+}
+
+void dvgaI_write_reg(uint8_t data)
+{
+  SPI.beginTransaction(SPISettings(100000, LSBFIRST, SPI_MODE0));
+  dvgaI_cs_high();
+  delay(10);
+  
+  SPI.transfer(data);
+  SPI.transfer(0x00);
+  dvgaI_cs_low();
+  // Serial.print("data: 0x");
+  // Serial.println(data, HEX);
+  SPI.endTransaction();
+}
+
+
+void dvga_serial(uint8_t g) 
+{
+  g &= 0x3F; // keep only 6 bits (0..63)
+  g ^= 0x3F; 
+
+  // Serial.print("Setting gain to: ");
+  // Serial.print(g);
+  // Serial.print(" (binary: ");
+  // for (int8_t i = 5; i >= 0; i--) Serial.print((g >> i) & 1);
+  // Serial.println(")");
+  dvga_write_reg(g);
+  dvgaI_write_reg(g);
+  
+}
+
+void demod_init()
+{
+  demod_set_default();
+  demod_write_reg(demod_reg_address::ADDR_ATT_IP3IC, 0x04);
+  demod_write_reg(demod_reg_address::ADDR_BAND_LF1_CF2, 0xAA);
+  demod_write_reg(demod_reg_address::ADDR_LVCM_CF1,0x42);
+  //demod_verify_all();
+}
+
 
 // --- Pins ---
 constexpr uint8_t CONVST_PIN = 2;   // D2 = PB25 = TIOA0
@@ -197,6 +298,38 @@ static void send_samples_usb() {
 }
 
 void setup() {
+
+   pinMode(LE, OUTPUT);
+   pinMode(PBAR, OUTPUT);
+   digitalWrite(LE, HIGH);
+
+   pinMode(DEMOD_CS_PIN, OUTPUT);
+   //pinMode(RFSW, OUTPUT);
+   digitalWrite(DEMOD_CS_PIN, HIGH);
+  // digitalWrite(RFSW, LOW);
+
+   pinMode(DVGA_CS_PIN, OUTPUT);
+   pinMode(OE, OUTPUT);
+   pinMode(DVGAI_CS_PIN, OUTPUT);
+   pinMode(DVGAI_OE, OUTPUT);
+ 
+   digitalWrite(DVGA_CS_PIN, LOW);
+   digitalWrite(OE, HIGH);    //enable output
+   digitalWrite(SENB, HIGH); //enable serial mode
+
+   digitalWrite(DVGAI_CS_PIN, LOW);
+   digitalWrite(DVGAI_OE, HIGH);    //enable output
+   digitalWrite(SENB, HIGH);
+   SPI.begin();
+  
+
+  
+   demod_init();
+   att_init_serial();
+   att_serial((uint8_t)1);
+   dvga_serial((uint8_t)32);
+  // delay(1000);
+
   // Use the Native USB port (SerialUSB). Baud ignored.
   SerialUSB.begin(115200);
 

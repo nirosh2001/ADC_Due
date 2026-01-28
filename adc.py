@@ -28,7 +28,7 @@ HDR_LEN = 10  # 4 + 4 + 2
 
 # Plot settings (edit here if you want, no terminal args needed)
 DISPLAY_POINTS = 4000      # points shown on screen (per channel)
-DECIMATE = 10              # plot every Nth sample (keeps matplotlib responsive)
+DECIMATE = 100              # plot every Nth sample (keeps matplotlib responsive)
 UPDATE_EVERY_FRAMES = 2    # redraw after this many frames
 
 
@@ -128,7 +128,8 @@ def main():
 
                 for _, count, payload in parse_frames(buf):
                     # Convert payload -> numpy array of shape (count,2)
-                    arr = np.frombuffer(payload, dtype="<u2").reshape(-1, 2)
+                    # Use signed int16 to properly handle two's complement data
+                    arr = np.frombuffer(payload, dtype="<i2").reshape(-1, 2)
 
                     # Decimate for plotting speed
                     if DECIMATE > 1:
