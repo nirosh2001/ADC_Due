@@ -1,0 +1,1 @@
+python adc_view.py --port COM13 --vref 5 --decim 1 --send_start
