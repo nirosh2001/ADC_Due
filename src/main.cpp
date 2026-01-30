@@ -325,6 +325,18 @@ static void send_samples_usb()
   }
 }
 
+// ---------- Test Mode State Machine ----------
+enum TestState
+{
+  STATE_ADC_SAMPLING,
+  STATE_WAIT_AFTER_ADC,
+  STATE_DVGA_WRITING
+};
+
+volatile TestState currentState = STATE_ADC_SAMPLING;
+volatile uint32_t stateStartTime = 0;
+volatile uint8_t dvgaGainValue = 0; // Cycles 0-63 for DVGA test
+
 void setup()
 {
   pinMode(LE, OUTPUT);
@@ -369,24 +381,132 @@ void setup()
 
   // Start sampling immediately once USB is up
   if (SerialUSB)
+  {
+    stateStartTime = millis(); // Initialize state timer
     start_sampling();
+    SerialUSB.println("=== Test Mode Started ===");
+    SerialUSB.println("Cycle: ADC(2s) -> Wait(1s) -> DVGA(2s) -> Repeat");
+  }
+}
+
+// Re-initialize SPI for software mode (DVGA writes)
+static void reinit_spi_software_mode()
+{
+  // Disable hardware SPI
+  SPI0->SPI_CR = SPI_CR_SPIDIS;
+
+  // Re-init Arduino SPI library for software-style use
+  SPI.end();
+  SPI.begin();
+}
+
+// Re-initialize SPI for hardware ADC mode
+static void reinit_spi_hw_adc_mode()
+{
+  setup_spi_hw_cs();
 }
 
 void loop()
 {
-  // Optional: allow host to control start/stop
-  // Send 'S' to start, 'P' to pause.
+  uint32_t now = millis();
+
+  // Optional: allow host to control start/stop via serial
   while (SerialUSB && SerialUSB.available())
   {
     int c = SerialUSB.read();
     if (c == 'S')
+    {
+      // Reset to ADC sampling state
+      currentState = STATE_ADC_SAMPLING;
+      stateStartTime = now;
+      reinit_spi_hw_adc_mode();
       start_sampling();
+    }
     else if (c == 'P')
+    {
       stop_sampling();
+    }
   }
 
-  send_samples_usb();
+  switch (currentState)
+  {
+  case STATE_ADC_SAMPLING:
+    // Continue sending samples while in this state
+    send_samples_usb();
 
-  // Optional quick health indicator (no spam)
-  // You can read rb_overflow from the debugger if needed.
+    // After 2 seconds, transition to wait state
+    if (now - stateStartTime >= 2000)
+    {
+      stop_sampling();
+
+      // Print status
+      if (SerialUSB)
+      {
+        SerialUSB.println("\n--- ADC sampling stopped (2s done) ---");
+        SerialUSB.print("Samples collected, overflow count: ");
+        SerialUSB.println(rb_overflow);
+      }
+
+      currentState = STATE_WAIT_AFTER_ADC;
+      stateStartTime = now;
+    }
+    break;
+
+  case STATE_WAIT_AFTER_ADC:
+    // Wait for 1 second
+    if (now - stateStartTime >= 1000)
+    {
+      if (SerialUSB)
+      {
+        SerialUSB.println("--- Starting DVGA write phase (2s) ---");
+      }
+
+      // Reconfigure SPI for DVGA (software mode)
+      reinit_spi_software_mode();
+
+      currentState = STATE_DVGA_WRITING;
+      stateStartTime = now;
+    }
+    break;
+
+  case STATE_DVGA_WRITING:
+    // Write to DVGA continuously for 2 seconds
+    // Change gain value periodically to demonstrate activity
+    {
+      static uint32_t lastDvgaWrite = 0;
+      if (now - lastDvgaWrite >= 100) // Write every 100ms
+      {
+        dvga_serial(dvgaGainValue);
+
+        if (SerialUSB)
+        {
+          SerialUSB.print("DVGA gain set to: ");
+          SerialUSB.println(dvgaGainValue);
+        }
+
+        // Cycle through gain values 0-63
+        dvgaGainValue = (dvgaGainValue + 4) & 0x3F;
+        lastDvgaWrite = now;
+      }
+    }
+
+    // After 2 seconds, go back to ADC sampling
+    if (now - stateStartTime >= 2000)
+    {
+      if (SerialUSB)
+      {
+        SerialUSB.println("--- DVGA write phase done, restarting ADC ---");
+      }
+
+      // Reconfigure SPI for ADC hardware mode
+      reinit_spi_hw_adc_mode();
+
+      // Start sampling again
+      start_sampling();
+
+      currentState = STATE_ADC_SAMPLING;
+      stateStartTime = now;
+    }
+    break;
+  }
 }
