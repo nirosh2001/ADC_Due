@@ -16,11 +16,16 @@ void att_write_reg(att_reg_address addr, uint8_t data)
 {
   SPI.beginTransaction(SPISettings(100000, LSBFIRST, SPI_MODE0));
   le_low();
+  delayMicroseconds(10);
   SPI.transfer(data);
   SPI.transfer(((uint8_t)addr) << 4);
+    delayMicroseconds(10);
   le_high();
+    delayMicroseconds(10);
   le_low();
+    delayMicroseconds(10);
   le_high();
+    delayMicroseconds(10);
   SPI.endTransaction();
 }
 
@@ -330,12 +335,17 @@ enum TestState
 {
   STATE_ADC_SAMPLING,
   STATE_WAIT_AFTER_ADC,
-  STATE_DVGA_WRITING
+  STATE_DVGA_WRITING,
+  STATE_WAIT_FOR_GAIN,
+  STATE_DIRECT_DVGA_WRITE
 };
 
 volatile TestState currentState = STATE_ADC_SAMPLING;
 volatile uint32_t stateStartTime = 0;
-volatile uint8_t dvgaGainValue = 0; // Cycles 0-63 for DVGA test
+volatile uint8_t dvgaGainValue = 0;       // Cycles 0-63 for DVGA test
+volatile uint8_t receivedGainValue = 0;   // Gain value received from Python
+volatile bool gainReceived = false;       // Flag to indicate gain was received
+volatile bool samplingWasRunning = false; // Track if sampling was running before direct write
 
 void setup()
 {
@@ -408,6 +418,7 @@ static void reinit_spi_hw_adc_mode()
 
 void loop()
 {
+
   uint32_t now = millis();
 
   // Optional: allow host to control start/stop via serial
@@ -426,6 +437,34 @@ void loop()
     {
       stop_sampling();
     }
+    else if (c == 'G')
+    {
+      stop_sampling();
+      currentState = STATE_WAIT_AFTER_ADC;
+    }
+    else if (c == 'V')
+    {
+      // Receive gain value: format "V<value>" where value is 0-63
+      // Wait for the value bytes
+      uint32_t timeout = millis() + 100;
+      while (!SerialUSB.available() && millis() < timeout)
+      {
+      }
+      if (SerialUSB.available())
+      {
+        receivedGainValue = (uint8_t)SerialUSB.parseInt();
+        receivedGainValue &= 0x3F; // Clamp to 0-63
+        gainReceived = true;
+        // Direct write to DVGA via state machine
+        samplingWasRunning = sampling_enabled;
+        if (samplingWasRunning)
+        {
+          stop_sampling();
+        }
+        currentState = STATE_WAIT_AFTER_ADC;
+        stateStartTime = now;
+      }
+    }
   }
 
   switch (currentState)
@@ -434,27 +473,11 @@ void loop()
     // Continue sending samples while in this state
     send_samples_usb();
 
-    // After 2 seconds, transition to wait state
-    if (now - stateStartTime >= 2000)
-    {
-      stop_sampling();
-
-      // Print status
-      if (SerialUSB)
-      {
-        SerialUSB.println("\n--- ADC sampling stopped (2s done) ---");
-        SerialUSB.print("Samples collected, overflow count: ");
-        SerialUSB.println(rb_overflow);
-      }
-
-      currentState = STATE_WAIT_AFTER_ADC;
-      stateStartTime = now;
-    }
     break;
 
   case STATE_WAIT_AFTER_ADC:
     // Wait for 1 second
-    if (now - stateStartTime >= 1000)
+    if (now - stateStartTime >= 100)
     {
       if (SerialUSB)
       {
@@ -463,20 +486,25 @@ void loop()
 
       // Reconfigure SPI for DVGA (software mode)
       reinit_spi_software_mode();
-
-      currentState = STATE_DVGA_WRITING;
+      if ( gainReceived){
+        currentState = STATE_DIRECT_DVGA_WRITE;
+        gainReceived = false; // reset flag
+      } else {
+        currentState = STATE_DVGA_WRITING;
+      }
       stateStartTime = now;
     }
     break;
 
   case STATE_DVGA_WRITING:
-    // Write to DVGA continuously for 2 seconds
-    // Change gain value periodically to demonstrate activity
+    // Write to DVGA continuously - sweep through all gain values once
     {
       static uint32_t lastDvgaWrite = 0;
+      static bool sweepComplete = false;
+
       if (now - lastDvgaWrite >= 100) // Write every 100ms
       {
-        dvga_serial(dvgaGainValue);
+        dvga_serial((uint8_t)dvgaGainValue);
 
         if (SerialUSB)
         {
@@ -484,26 +512,66 @@ void loop()
           SerialUSB.println(dvgaGainValue);
         }
 
-        // Cycle through gain values 0-63
-        dvgaGainValue = (dvgaGainValue + 4) & 0x3F;
+        // Cycle through gain values 0-63 in steps of 4
+        dvgaGainValue = (dvgaGainValue + 4) & 0x1C;
         lastDvgaWrite = now;
+
+        // Check if we've completed one full sweep (wrapped back to 0)
+        if (dvgaGainValue == 0)
+        {
+          sweepComplete = true;
+        }
+      }
+
+      // Exit when sweep is complete
+      if (sweepComplete)
+      {
+        sweepComplete = false; // Reset for next time
+        dvgaGainValue = 0;     // Reset gain value
+
+        if (SerialUSB)
+        {
+          SerialUSB.println("--- DVGA sweep complete, restarting ADC ---");
+        }
+
+        // Reconfigure SPI for ADC hardware mode
+        reinit_spi_hw_adc_mode();
+
+        // Start sampling again
+        start_sampling();
+
+        currentState = STATE_ADC_SAMPLING;
+        stateStartTime = now;
       }
     }
+    break;
 
-    // After 2 seconds, go back to ADC sampling
-    if (now - stateStartTime >= 2000)
+  case STATE_DIRECT_DVGA_WRITE:
+    // Direct DVGA write state - switch SPI, write, switch back
     {
+      // Switch to software SPI mode for DVGA write
+      reinit_spi_software_mode();
+
+      // Write the gain value
+      dvga_serial((uint8_t)receivedGainValue);
+      delay(2000);
+
       if (SerialUSB)
       {
-        SerialUSB.println("--- DVGA write phase done, restarting ADC ---");
+        SerialUSB.print("Direct DVGA write, gain: ");
+        SerialUSB.println(receivedGainValue);
       }
 
-      // Reconfigure SPI for ADC hardware mode
+      // Switch back to hardware SPI mode for ADC
       reinit_spi_hw_adc_mode();
 
-      // Start sampling again
-      start_sampling();
+      // Resume sampling if it was running before
+      if (samplingWasRunning)
+      {
+        start_sampling();
+      }
 
+      // Return to ADC sampling state
       currentState = STATE_ADC_SAMPLING;
       stateStartTime = now;
     }

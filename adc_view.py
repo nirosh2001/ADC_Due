@@ -6,7 +6,7 @@ from collections import deque
 import numpy as np
 import serial
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
+from matplotlib.widgets import Slider, Button
 
 MAGIC = b"ADC\n"
 HDR_LEN = 10  # 'A''D''C''\n' + uint32 seq + uint16 count
@@ -137,6 +137,36 @@ def main():
         fontsize=9, ha='left', va='center'
     )
 
+    # ----- DVGA Sweep Button (send 'G' command) -----
+    ax_dvga_btn = fig.add_axes([0.65, 0.02, 0.06, 0.03])
+    btn_dvga = Button(ax_dvga_btn, 'Sweep', color='lightyellow', hovercolor='khaki')
+
+    def on_dvga(event):
+        ser.write(b"G")  # Send G command to start DVGA sweep
+
+    btn_dvga.on_clicked(on_dvga)
+
+    # ----- Gain Slider and Send Button -----
+    ax_gain = fig.add_axes([0.72, 0.02, 0.12, 0.03])
+    s_gain = Slider(
+        ax=ax_gain,
+        label="Gain",
+        valmin=0,
+        valmax=63,
+        valinit=32,
+        valstep=1,
+    )
+
+    ax_send_gain_btn = fig.add_axes([0.85, 0.02, 0.06, 0.03])
+    btn_send_gain = Button(ax_send_gain_btn, 'Send', color='lightgreen', hovercolor='palegreen')
+
+    def on_send_gain(event):
+        gain_val = int(s_gain.val)
+        ser.write(f"V{gain_val}".encode())  # Send V<gain> command
+        print(f"Sent gain value: {gain_val}")
+
+    btn_send_gain.on_clicked(on_send_gain)
+
     running = True
     def on_close(_evt):
         nonlocal running
@@ -241,6 +271,24 @@ def main():
         # Aggressive buffer trim to stay real-time (skip old data)
         if len(rx) > 30000:
             rx[:] = rx[-10000:]
+
+        # Check for text messages (lines not starting with 'ADC\n')
+        # Look for complete lines ending with \n that aren't ADC packets
+        while b'\n' in rx:
+            newline_pos = rx.index(b'\n')
+            # Check if this is NOT an ADC packet header
+            if newline_pos >= 3 and rx[newline_pos-3:newline_pos+1] == MAGIC:
+                # This is part of an ADC header, don't treat as text
+                break
+            # Extract the line as text
+            line_bytes = bytes(rx[:newline_pos])
+            del rx[:newline_pos + 1]
+            try:
+                line_text = line_bytes.decode('utf-8', errors='ignore').strip()
+                if line_text and not line_text.startswith('ADC'):
+                    print(f"[Arduino] {line_text}")
+            except:
+                pass
 
         while True:
             m = rx.find(MAGIC)
