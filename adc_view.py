@@ -43,6 +43,11 @@ def main():
     ch2v = deque(maxlen=args.buffer_points)
     k = 0
 
+    # Sample rate measurement
+    sample_count = 0
+    sample_count_start = time.time()
+    last_rate_print = time.time()
+
     # Effective sample rate after decimation (for FFT frequency axis)
     fs_eff = args.sample_rate / max(1, args.decim)
 
@@ -78,7 +83,7 @@ def main():
 
     # ----- Sliders -----
     # X window slider
-    ax_x = fig.add_axes([0.12, 0.17, 0.76, 0.03])
+    ax_x = fig.add_axes([0.12, 0.17, 0.50, 0.03])
     init_x = max(args.min_xwindow, min(args.init_xwindow, args.buffer_points))
     sx = Slider(
         ax=ax_x,
@@ -90,7 +95,7 @@ def main():
     )
 
     # Y range slider (symmetric +/- range)
-    ax_y = fig.add_axes([0.12, 0.12, 0.76, 0.03])
+    ax_y = fig.add_axes([0.12, 0.12, 0.50, 0.03])
     init_y = max(0.001, min(float(args.init_yrange), float(args.vref)))
     sy = Slider(
         ax=ax_y,
@@ -102,7 +107,7 @@ def main():
     )
 
     # Max frequency slider for FFT zoom
-    ax_fmax = fig.add_axes([0.12, 0.07, 0.76, 0.03])
+    ax_fmax = fig.add_axes([0.12, 0.07, 0.50, 0.03])
     max_nyquist = fs_eff / 2.0
     init_fmax = min(args.max_freq, max_nyquist)
     s_fmax = Slider(
@@ -115,7 +120,7 @@ def main():
     )
 
     # FFT bin size slider (power of 2 values)
-    ax_fft_n = fig.add_axes([0.12, 0.02, 0.50, 0.03])
+    ax_fft_n = fig.add_axes([0.12, 0.02, 0.40, 0.03])
     fft_sizes = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
     init_fft_idx = fft_sizes.index(args.fft_points) if args.fft_points in fft_sizes else 5
     s_fft_n = Slider(
@@ -146,11 +151,11 @@ def main():
 
     btn_dvga.on_clicked(on_dvga)
 
-    # ----- Gain Slider and Send Button -----
+    # ----- DVGA Gain Slider and Send Button -----
     ax_gain = fig.add_axes([0.72, 0.02, 0.12, 0.03])
     s_gain = Slider(
         ax=ax_gain,
-        label="Gain",
+        label="DVGA",
         valmin=0,
         valmax=63,
         valinit=32,
@@ -163,9 +168,49 @@ def main():
     def on_send_gain(event):
         gain_val = int(s_gain.val)
         ser.write(f"V{gain_val}".encode())  # Send V<gain> command
-        print(f"Sent gain value: {gain_val}")
+        print(f"Sent DVGA gain value: {gain_val}")
 
     btn_send_gain.on_clicked(on_send_gain)
+
+    # ----- Attenuator Slider and Send Button -----
+    ax_att = fig.add_axes([0.72, 0.06, 0.12, 0.03])
+    s_att = Slider(
+        ax=ax_att,
+        label="ATT",
+        valmin=0,
+        valmax=127,
+        valinit=1,
+        valstep=1,
+    )
+
+    ax_send_att_btn = fig.add_axes([0.85, 0.06, 0.06, 0.03])
+    btn_send_att = Button(ax_send_att_btn, 'Send', color='lightskyblue', hovercolor='deepskyblue')
+
+    def on_send_att(event):
+        att_val = int(s_att.val)
+        ser.write(f"A{att_val}".encode())  # Send A<att> command
+        print(f"Sent ATT value: {att_val}")
+
+    btn_send_att.on_clicked(on_send_att)
+
+    # ----- ADC Start/Stop Buttons -----
+    ax_start_btn = fig.add_axes([0.65, 0.12, 0.06, 0.03])
+    btn_start = Button(ax_start_btn, 'Start', color='lightgreen', hovercolor='lime')
+
+    def on_start(event):
+        ser.write(b"S")  # Send S command to start ADC sampling
+        print("Sent Start command")
+
+    btn_start.on_clicked(on_start)
+
+    ax_stop_btn = fig.add_axes([0.65, 0.08, 0.06, 0.03])
+    btn_stop = Button(ax_stop_btn, 'Stop', color='lightcoral', hovercolor='red')
+
+    def on_stop(event):
+        ser.write(b"P")  # Send P command to stop ADC sampling
+        print("Sent Stop command")
+
+    btn_stop.on_clicked(on_stop)
 
     running = True
     def on_close(_evt):
@@ -272,31 +317,39 @@ def main():
         if len(rx) > 30000:
             rx[:] = rx[-10000:]
 
-        # Check for text messages (lines not starting with 'ADC\n')
-        # Look for complete lines ending with \n that aren't ADC packets
-        while b'\n' in rx:
-            newline_pos = rx.index(b'\n')
-            # Check if this is NOT an ADC packet header
-            if newline_pos >= 3 and rx[newline_pos-3:newline_pos+1] == MAGIC:
-                # This is part of an ADC header, don't treat as text
-                break
-            # Extract the line as text
-            line_bytes = bytes(rx[:newline_pos])
-            del rx[:newline_pos + 1]
-            try:
-                line_text = line_bytes.decode('utf-8', errors='ignore').strip()
-                if line_text and not line_text.startswith('ADC'):
-                    print(f"[Arduino] {line_text}")
-            except:
-                pass
-
+        # First, process all complete ADC packets
         while True:
             m = rx.find(MAGIC)
             if m < 0:
+                # No ADC packet found - check for text messages
+                # Only process text if no MAGIC is present at all
+                while b'\n' in rx:
+                    newline_pos = rx.index(b'\n')
+                    line_bytes = bytes(rx[:newline_pos])
+                    del rx[:newline_pos + 1]
+                    try:
+                        # Only print if it looks like printable ASCII text
+                        line_text = line_bytes.decode('ascii', errors='strict').strip()
+                        if line_text and len(line_text) > 2:
+                            print(f"[Arduino] {line_text}")
+                    except:
+                        pass  # Not valid ASCII, skip it
                 break
 
             if m > 0:
+                # There's data before the MAGIC - could be text message
+                prefix = bytes(rx[:m])
                 del rx[:m]
+                try:
+                    # Try to decode as ASCII text
+                    text = prefix.decode('ascii', errors='strict').strip()
+                    if text and len(text) > 2:
+                        for line in text.split('\n'):
+                            line = line.strip()
+                            if line:
+                                print(f"[Arduino] {line}")
+                except:
+                    pass  # Not valid ASCII, discard
 
             if len(rx) < HDR_LEN:
                 break
@@ -317,6 +370,9 @@ def main():
             a1 = pairs[:, 0].astype(np.float32) * lsb
             a2 = pairs[:, 1].astype(np.float32) * lsb
 
+            # Count raw samples (before decimation)
+            sample_count += len(pairs)
+
             d = max(1, args.decim)
             a1 = a1[::d]
             a2 = a2[::d]
@@ -328,6 +384,17 @@ def main():
                 k += 1
 
         now = time.time()
+        
+        # Print sample rate every 2 seconds
+        if now - last_rate_print >= 2.0:
+            elapsed = now - sample_count_start
+            if elapsed > 0:
+                rate = sample_count / elapsed
+                print(f"[Sample Rate] {sample_count} samples in {elapsed:.2f}s = {rate:.1f} Hz ({rate/1000:.2f} kHz)")
+            sample_count = 0
+            sample_count_start = now
+            last_rate_print = now
+        
         if now - last_redraw > 0.05:
             redraw()
             last_redraw = now

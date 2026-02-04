@@ -2,6 +2,21 @@
 #include <SPI.h>
 #include "registers.h"
 
+// ----------------- Attenuator Mode Selection -----------------
+// Set to true for parallel mode, false for serial mode
+bool attParallelMode = true;
+
+// Parallel mode pin array
+const uint8_t attParallelPins[7] = {ATT_D0, ATT_D1, ATT_D2, ATT_D3, ATT_D4, ATT_D5, ATT_D6};
+
+// ----------------- DVGA Mode Selection -----------------
+// Set to true for parallel mode, false for serial mode
+bool dvgaParallelMode = true;
+
+// DVGA parallel mode pin arrays
+const uint8_t dvgaParallelPins[6] = {DVGA_D0, DVGA_D1, DVGA_D2, DVGA_D3, DVGA_D4, DVGA_D5};
+const uint8_t dvgaIParallelPins[6] = {DVGAI_D0, DVGAI_D1, DVGAI_D2, DVGAI_D3, DVGAI_D4, DVGAI_D5};
+
 // ----------------- Your existing helpers -----------------
 static inline void dvga_cs_low() { digitalWrite(DVGA_CS_PIN, LOW); }
 static inline void dvga_cs_high() { digitalWrite(DVGA_CS_PIN, HIGH); }
@@ -19,13 +34,13 @@ void att_write_reg(att_reg_address addr, uint8_t data)
   delayMicroseconds(10);
   SPI.transfer(data);
   SPI.transfer(((uint8_t)addr) << 4);
-    delayMicroseconds(10);
+  delayMicroseconds(10);
   le_high();
-    delayMicroseconds(10);
+  delayMicroseconds(10);
   le_low();
-    delayMicroseconds(10);
+  delayMicroseconds(10);
   le_high();
-    delayMicroseconds(10);
+  delayMicroseconds(10);
   SPI.endTransaction();
 }
 
@@ -41,36 +56,179 @@ void att_serial(uint8_t g)
   att_write_reg(att_reg_address::REG_ATTN, g);
 }
 
+// Attenuator parallel mode functions
+void att_init_parallel()
+{
+  // Set parallel pins as outputs
+  for (uint8_t i = 0; i < 7; i++)
+  {
+    pinMode(attParallelPins[i], OUTPUT);
+    digitalWrite(attParallelPins[i], LOW);
+  }
+  digitalWrite(PBAR, LOW); // Enable parallel mode
+  digitalWrite(LE, HIGH);  // Latch enabled
+}
+
+void att_parallel(uint8_t g)
+{
+  g &= 0x7F; // keep only 7 bits (0..127)
+
+  // Set each bit on the parallel pins
+  for (uint8_t i = 0; i < 7; i++)
+  {
+    digitalWrite(attParallelPins[i], ((g >> i) & 0x01) ? HIGH : LOW);
+  }
+
+  // Pulse LE to latch the data
+  le_low();
+  delayMicroseconds(10);
+  le_high();
+  delayMicroseconds(10);
+}
+
+// Unified attenuator set function - uses current mode
+void att_set(uint8_t g)
+{
+  if (attParallelMode)
+  {
+    att_parallel(g);
+  }
+  else
+  {
+    att_serial(g);
+  }
+}
+
+// Switch attenuator mode
+void att_set_mode(bool parallel)
+{
+  attParallelMode = parallel;
+  if (parallel)
+  {
+    att_init_parallel();
+  }
+  else
+  {
+    att_init_serial();
+  }
+}
+
 void dvga_write_reg(uint8_t data)
 {
   SPI.beginTransaction(SPISettings(100000, LSBFIRST, SPI_MODE0));
-  dvga_cs_high();
-  delay(10);
+  dvga_cs_high(); // Select chip (CS active HIGH)
+  delayMicroseconds(100);
 
   SPI.transfer(data);
-  SPI.transfer(0x00);
-  dvga_cs_low();
+  delayMicroseconds(10);
+  SPI.transfer(data);
+
+  delayMicroseconds(100);
+  dvga_cs_low(); // Deselect chip to latch data
+  delayMicroseconds(10);
   SPI.endTransaction();
 }
 
 void dvgaI_write_reg(uint8_t data)
 {
   SPI.beginTransaction(SPISettings(100000, LSBFIRST, SPI_MODE0));
-  dvgaI_cs_high();
-  delay(10);
+  dvgaI_cs_high(); // Select chip (CS active HIGH)
+  delayMicroseconds(100);
 
   SPI.transfer(data);
-  SPI.transfer(0x00);
-  dvgaI_cs_low();
+  delayMicroseconds(10);
+  SPI.transfer(data);
+
+  delayMicroseconds(100);
+  dvgaI_cs_low(); // Deselect chip to latch data
+  delayMicroseconds(10);
   SPI.endTransaction();
 }
 
+// DVGA serial mode write (writes to both ICs)
 void dvga_serial(uint8_t g)
 {
   g &= 0x3F; // keep only 6 bits (0..63)
-  g ^= 0x3F;
   dvga_write_reg(g);
+  delayMicroseconds(10);
   dvgaI_write_reg(g);
+}
+
+// DVGA serial mode initialization
+void dvga_init_serial()
+{
+  digitalWrite(SENB, HIGH);       // Enable serial mode for DVGA1
+  digitalWrite(DVGAI_SENB, HIGH); // Enable serial mode for DVGA2
+  digitalWrite(DVGA_CS_PIN, LOW);
+  digitalWrite(DVGAI_CS_PIN, LOW);
+}
+
+// DVGA parallel mode initialization
+void dvga_init_parallel()
+{
+  // Set DVGA1 parallel pins as outputs
+  for (uint8_t i = 0; i < 6; i++)
+  {
+    pinMode(dvgaParallelPins[i], OUTPUT);
+    digitalWrite(dvgaParallelPins[i], LOW);
+  }
+
+  // Set DVGA2 parallel pins as outputs
+  for (uint8_t i = 0; i < 6; i++)
+  {
+    pinMode(dvgaIParallelPins[i], OUTPUT);
+    digitalWrite(dvgaIParallelPins[i], LOW);
+  }
+
+  digitalWrite(SENB, LOW);       // Enable parallel mode for DVGA1
+  digitalWrite(DVGAI_SENB, LOW); // Enable parallel mode for DVGA2
+}
+
+// DVGA parallel mode write (writes to both ICs)
+void dvga_parallel(uint8_t g)
+{
+  g &= 0x3F; // keep only 6 bits (0..63)
+
+  // Write to DVGA1
+  for (uint8_t i = 0; i < 6; i++)
+  {
+    digitalWrite(dvgaParallelPins[i], ((g >> i) & 0x01) ? HIGH : LOW);
+  }
+
+  // Write to DVGA2
+  for (uint8_t i = 0; i < 6; i++)
+  {
+    digitalWrite(dvgaIParallelPins[i], ((g >> i) & 0x01) ? HIGH : LOW);
+  }
+
+  delayMicroseconds(10);
+}
+
+// Unified DVGA set function - uses current mode
+void dvga_set(uint8_t g)
+{
+  if (dvgaParallelMode)
+  {
+    dvga_parallel(g);
+  }
+  else
+  {
+    dvga_serial(g);
+  }
+}
+
+// Switch DVGA mode
+void dvga_set_mode(bool parallel)
+{
+  dvgaParallelMode = parallel;
+  if (parallel)
+  {
+    dvga_init_parallel();
+  }
+  else
+  {
+    dvga_init_serial();
+  }
 }
 
 void demod_init()
@@ -179,7 +337,7 @@ static void setup_spi_hw_cs()
 
 static void setup_convst_and_timer_trigger_config_only()
 {
-  const uint32_t tc_clk_hz = VARIANT_MCK / 2; // 42 MHz
+  const uint32_t tc_clk_hz = VARIANT_MCK / 8; // 42 MHz
 
   uint32_t low_ticks = ns_to_ticks(CONVST_LOW_NS, tc_clk_hz);
   uint32_t high_ticks = ns_to_ticks(CONVST_HIGH_NS, tc_clk_hz);
@@ -337,7 +495,8 @@ enum TestState
   STATE_WAIT_AFTER_ADC,
   STATE_DVGA_WRITING,
   STATE_WAIT_FOR_GAIN,
-  STATE_DIRECT_DVGA_WRITE
+  STATE_DIRECT_DVGA_WRITE,
+  STATE_DIRECT_ATT_WRITE
 };
 
 volatile TestState currentState = STATE_ADC_SAMPLING;
@@ -345,6 +504,8 @@ volatile uint32_t stateStartTime = 0;
 volatile uint8_t dvgaGainValue = 0;       // Cycles 0-63 for DVGA test
 volatile uint8_t receivedGainValue = 0;   // Gain value received from Python
 volatile bool gainReceived = false;       // Flag to indicate gain was received
+volatile uint8_t receivedAttValue = 0;    // Attenuator value received from Python
+volatile bool attReceived = false;        // Flag to indicate attenuator value was received
 volatile bool samplingWasRunning = false; // Track if sampling was running before direct write
 
 void setup()
@@ -358,23 +519,49 @@ void setup()
 
   pinMode(DVGA_CS_PIN, OUTPUT);
   pinMode(OE, OUTPUT);
+  pinMode(SENB, OUTPUT);
+  pinMode(DVGA_DENA, OUTPUT);
+  pinMode(DVGA_DENB, OUTPUT);
   pinMode(DVGAI_CS_PIN, OUTPUT);
   pinMode(DVGAI_OE, OUTPUT);
+  pinMode(DVGAI_SENB, OUTPUT);
+  pinMode(DVGAI_DENA, OUTPUT);
+  pinMode(DVGAI_DENB, OUTPUT);
 
   digitalWrite(DVGA_CS_PIN, LOW);
-  digitalWrite(OE, HIGH);   // enable output
-  digitalWrite(SENB, HIGH); // enable serial mode
-
+  digitalWrite(OE, HIGH);        // enable output
+  digitalWrite(DVGA_DENA, HIGH); // enable channel A
+  digitalWrite(DVGA_DENB, HIGH); // enable channel B
   digitalWrite(DVGAI_CS_PIN, LOW);
-  digitalWrite(DVGAI_OE, HIGH); // enable output
-  digitalWrite(SENB, HIGH);
+  digitalWrite(DVGAI_OE, HIGH);   // enable output
+  digitalWrite(DVGAI_DENA, HIGH); // enable channel A
+  digitalWrite(DVGAI_DENB, HIGH); // enable channel B
+
+  // Initialize DVGA based on mode
+  if (dvgaParallelMode)
+  {
+    dvga_init_parallel();
+  }
+  else
+  {
+    dvga_init_serial();
+  }
 
   SPI.begin();
 
   demod_init();
-  att_init_serial();
-  att_serial((uint8_t)1);
-  dvga_serial((uint8_t)32);
+
+  // Initialize attenuator based on mode
+  if (attParallelMode)
+  {
+    att_init_parallel();
+  }
+  else
+  {
+    att_init_serial();
+  }
+  att_set((uint8_t)1);
+  // dvga_serial((uint8_t)32);
 
   // Native USB port (baud ignored)
   SerialUSB.begin(115200);
@@ -465,6 +652,28 @@ void loop()
         stateStartTime = now;
       }
     }
+    else if (c == 'A')
+    {
+      // Receive attenuator value: format "A<value>" where value is 0-127
+      uint32_t timeout = millis() + 100;
+      while (!SerialUSB.available() && millis() < timeout)
+      {
+      }
+      if (SerialUSB.available())
+      {
+        receivedAttValue = (uint8_t)SerialUSB.parseInt();
+        receivedAttValue &= 0x7F; // Clamp to 0-127
+        attReceived = true;
+        // Direct write to attenuator via state machine
+        samplingWasRunning = sampling_enabled;
+        if (samplingWasRunning)
+        {
+          stop_sampling();
+        }
+        currentState = STATE_DIRECT_ATT_WRITE;
+        stateStartTime = now;
+      }
+    }
   }
 
   switch (currentState)
@@ -486,10 +695,13 @@ void loop()
 
       // Reconfigure SPI for DVGA (software mode)
       reinit_spi_software_mode();
-      if ( gainReceived){
+      if (gainReceived)
+      {
         currentState = STATE_DIRECT_DVGA_WRITE;
         gainReceived = false; // reset flag
-      } else {
+      }
+      else
+      {
         currentState = STATE_DVGA_WRITING;
       }
       stateStartTime = now;
@@ -504,12 +716,13 @@ void loop()
 
       if (now - lastDvgaWrite >= 100) // Write every 100ms
       {
-        dvga_serial((uint8_t)dvgaGainValue);
+        dvga_set((uint8_t)dvgaGainValue);
 
         if (SerialUSB)
         {
           SerialUSB.print("DVGA gain set to: ");
-          SerialUSB.println(dvgaGainValue);
+          SerialUSB.print(dvgaGainValue);
+          SerialUSB.println(dvgaParallelMode ? " (parallel)" : " (serial)");
         }
 
         // Cycle through gain values 0-63 in steps of 4
@@ -549,18 +762,58 @@ void loop()
   case STATE_DIRECT_DVGA_WRITE:
     // Direct DVGA write state - switch SPI, write, switch back
     {
-      // Switch to software SPI mode for DVGA write
-      reinit_spi_software_mode();
+      // Switch to software SPI mode for DVGA write (only needed for serial mode)
+      if (!dvgaParallelMode)
+      {
+        reinit_spi_software_mode();
+      }
 
-      // Write the gain value
-      dvga_serial((uint8_t)receivedGainValue);
-      delay(2000);
+      // Write the gain value (uses serial or parallel based on mode)
+      dvga_set((uint8_t)receivedGainValue);
+      delay(100);
 
       if (SerialUSB)
       {
-        SerialUSB.print("Direct DVGA write, gain: ");
-        SerialUSB.println(receivedGainValue);
+        SerialUSB.print("DVGA set to: ");
+        SerialUSB.print(receivedGainValue);
+        SerialUSB.print(dvgaParallelMode ? " (parallel)" : " (serial)");
+        SerialUSB.println();
       }
+
+      // Switch back to hardware SPI mode for ADC
+      reinit_spi_hw_adc_mode();
+
+      // Resume sampling if it was running before
+      if (samplingWasRunning)
+      {
+        start_sampling();
+      }
+
+      // Return to ADC sampling state
+      currentState = STATE_ADC_SAMPLING;
+      stateStartTime = now;
+    }
+    break;
+
+  case STATE_DIRECT_ATT_WRITE:
+    // Direct attenuator write state - switch SPI, write, switch back
+    {
+      // Switch to software SPI mode for attenuator write
+      reinit_spi_software_mode();
+
+      // Write the attenuator value (uses serial or parallel based on mode)
+      att_set((uint8_t)receivedAttValue);
+      delay(100);
+
+      if (SerialUSB)
+      {
+        SerialUSB.print("Attenuator set to: ");
+        SerialUSB.print(receivedAttValue);
+        SerialUSB.print(attParallelMode ? " (parallel)" : " (serial)");
+        SerialUSB.println();
+      }
+
+      attReceived = false; // Reset flag
 
       // Switch back to hardware SPI mode for ADC
       reinit_spi_hw_adc_mode();
