@@ -246,10 +246,10 @@ constexpr uint8_t CONVST_PIN = 2; // D2 = PB25 = TIOA0
 constexpr uint8_t CS1_PIN = 10;   // SPI CS0 (hardware)
 constexpr uint8_t CS2_PIN = 4;    // SPI CS1 (hardware)
 
-// --- Timing targets ---
+// --- Timing targets (16 kHz sample rate) ---
 constexpr uint32_t CONVST_LOW_NS = 100;
-constexpr uint32_t CONVST_HIGH_NS = 12400 * 5; // 12.5us period => 80kSPS
-constexpr uint32_t TCONV_MAX_NS = 8800;        // ADS8867 tconv max
+constexpr uint32_t CONVST_HIGH_NS = 62400; // 62.5us total period => 16kSPS
+constexpr uint32_t TCONV_MAX_NS = 8800;    // ADS8867 tconv max
 
 // SPI clock
 constexpr uint32_t SPI_SCK_HZ = 14000000;
@@ -337,7 +337,7 @@ static void setup_spi_hw_cs()
 
 static void setup_convst_and_timer_trigger_config_only()
 {
-  const uint32_t tc_clk_hz = VARIANT_MCK / 8; // 42 MHz
+  const uint32_t tc_clk_hz = VARIANT_MCK / 2; // 42 MHz (TIMER_CLOCK1 = MCK/2)
 
   uint32_t low_ticks = ns_to_ticks(CONVST_LOW_NS, tc_clk_hz);
   uint32_t high_ticks = ns_to_ticks(CONVST_HIGH_NS, tc_clk_hz);

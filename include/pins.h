@@ -22,16 +22,16 @@
 #define OE 7
 #define SENB 6
 #define DVGA_CS_PIN 5
-#define DVGA_DENA 34
-#define DVGA_DENB 35
+#define DVGA_DENA 32
+#define DVGA_DENB 31
 
 // DVGA IC 1 parallel mode pins (D0-D5)
-#define DVGA_D0 22
-#define DVGA_D1 23
-#define DVGA_D2 24
-#define DVGA_D3 25
-#define DVGA_D4 26
-#define DVGA_D5 27
+#define DVGA_D0 5
+#define DVGA_D1 37
+#define DVGA_D2 36
+#define DVGA_D3 35
+#define DVGA_D4 34
+#define DVGA_D5 33
 
 // DVGA IC 2
 #define DVGAI_OE 11
