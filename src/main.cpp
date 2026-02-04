@@ -674,6 +674,134 @@ void loop()
         stateStartTime = now;
       }
     }
+    else if (c == 'D')
+    {
+      // Demodulator register write: format "D<reg_id><value>"
+      // reg_id: 0=DCOI, 1=DCOQ, 2=HD2IX, 3=HD2IY, 4=HD2QX, 5=HD2QY,
+      //         6=HD3IX, 7=HD3IY, 8=HD3QX, 9=HD3QY
+      uint32_t timeout = millis() + 100;
+      while (!SerialUSB.available() && millis() < timeout)
+      {
+      }
+      if (SerialUSB.available())
+      {
+        char regId = SerialUSB.read();
+        timeout = millis() + 100;
+        while (!SerialUSB.available() && millis() < timeout)
+        {
+        }
+        if (SerialUSB.available())
+        {
+          uint8_t value = (uint8_t)SerialUSB.parseInt();
+          demod_reg_address addr;
+          const char *regName = "";
+
+          switch (regId)
+          {
+          case '0':
+            addr = demod_reg_address::ADDR_DCOI;
+            regName = "DCOI";
+            break;
+          case '1':
+            addr = demod_reg_address::ADDR_DCOQ;
+            regName = "DCOQ";
+            break;
+          case '2':
+            addr = demod_reg_address::ADDR_HD2IX;
+            regName = "HD2IX";
+            break;
+          case '3':
+            addr = demod_reg_address::ADDR_HD2IY;
+            regName = "HD2IY";
+            break;
+          case '4':
+            addr = demod_reg_address::ADDR_HD2QX;
+            regName = "HD2QX";
+            break;
+          case '5':
+            addr = demod_reg_address::ADDR_HD2QY;
+            regName = "HD2QY";
+            break;
+          case '6':
+            addr = demod_reg_address::ADDR_HD3IX;
+            regName = "HD3IX";
+            break;
+          case '7':
+            addr = demod_reg_address::ADDR_HD3IY;
+            regName = "HD3IY";
+            break;
+          case '8':
+            addr = demod_reg_address::ADDR_HD3QX;
+            regName = "HD3QX";
+            break;
+          case '9':
+            addr = demod_reg_address::ADDR_HD3QY;
+            regName = "HD3QY";
+            break;
+          case 'A': // GERR - bits [5:0] of ADDR_GERR_IP3CC (0x11)
+          {
+            bool wasRunning = sampling_enabled;
+            if (wasRunning)
+              stop_sampling();
+            reinit_spi_software_mode();
+            uint8_t current = demod_read_reg(demod_reg_address::ADDR_GERR_IP3CC);
+            current = (current & 0xC0) | (value & 0x3F); // Keep bits [7:6], set bits [5:0]
+            demod_write_reg(demod_reg_address::ADDR_GERR_IP3CC, current);
+            reinit_spi_hw_adc_mode();
+            if (wasRunning)
+              start_sampling();
+            if (SerialUSB)
+            {
+              SerialUSB.print("GERR set to: ");
+              SerialUSB.println(value);
+            }
+            return;
+          }
+          case 'B': // DEMOD_ATT - bits [4:0] of ADDR_ATT_IP3IC (0x10)
+          {
+            bool wasRunning = sampling_enabled;
+            if (wasRunning)
+              stop_sampling();
+            reinit_spi_software_mode();
+            uint8_t current = demod_read_reg(demod_reg_address::ADDR_ATT_IP3IC);
+            current = (current & 0xE0) | (value & 0x1F); // Keep bits [7:5], set bits [4:0]
+            demod_write_reg(demod_reg_address::ADDR_ATT_IP3IC, current);
+            reinit_spi_hw_adc_mode();
+            if (wasRunning)
+              start_sampling();
+            if (SerialUSB)
+            {
+              SerialUSB.print("DEMOD_ATT set to: ");
+              SerialUSB.println(value);
+            }
+            return;
+          }
+          default:
+            return; // Invalid register ID
+          }
+
+          // Temporarily stop sampling for SPI access
+          bool wasRunning = sampling_enabled;
+          if (wasRunning)
+          {
+            stop_sampling();
+          }
+          reinit_spi_software_mode();
+          demod_write_reg(addr, value);
+          reinit_spi_hw_adc_mode();
+          if (wasRunning)
+          {
+            start_sampling();
+          }
+          if (SerialUSB)
+          {
+            SerialUSB.print(regName);
+            SerialUSB.print(" set to: ");
+            SerialUSB.println(value);
+          }
+        }
+      }
+    }
   }
 
   switch (currentState)
