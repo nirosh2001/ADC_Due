@@ -246,9 +246,9 @@ constexpr uint8_t CONVST_PIN = 2; // D2 = PB25 = TIOA0
 constexpr uint8_t CS1_PIN = 10;   // SPI CS0 (hardware)
 constexpr uint8_t CS2_PIN = 4;    // SPI CS1 (hardware)
 
-// --- Timing targets (16 kHz sample rate) ---
+// --- Timing targets (30 kHz sample rate) ---
 constexpr uint32_t CONVST_LOW_NS = 100;
-constexpr uint32_t CONVST_HIGH_NS = 62400; // 62.5us total period => 16kSPS
+constexpr uint32_t CONVST_HIGH_NS = 33200; // 33.3us total period => 30kSPS
 constexpr uint32_t TCONV_MAX_NS = 8800;    // ADS8867 tconv max
 
 // SPI clock
@@ -772,6 +772,56 @@ void loop()
             if (SerialUSB)
             {
               SerialUSB.print("DEMOD_ATT set to: ");
+              SerialUSB.println(value);
+            }
+            return;
+          }
+          case 'C': // AMPG - bits [6:4] of ADDR_PHA_0_AMPG_AMPCC_AMPIC (0x15)
+          {
+            bool wasRunning = sampling_enabled;
+            if (wasRunning)
+              stop_sampling();
+            reinit_spi_software_mode();
+            uint8_t current = demod_read_reg(demod_reg_address::ADDR_PHA_0_AMPG_AMPCC_AMPIC);
+            current = (current & 0x8F) | ((value & 0x07) << 4); // Keep bits [7] and [3:0], set bits [6:4]
+            demod_write_reg(demod_reg_address::ADDR_PHA_0_AMPG_AMPCC_AMPIC, current);
+            reinit_spi_hw_adc_mode();
+            if (wasRunning)
+              start_sampling();
+            if (SerialUSB)
+            {
+              SerialUSB.print("AMPG set to: ");
+              SerialUSB.println(value);
+            }
+            return;
+          }
+          case 'F': // PHA - 9-bit register across ADDR_PHA_8 (0x14) and ADDR_PHA_0_AMPG_AMPCC_AMPIC (0x15)
+          {
+            // PHA[8:1] goes to ADDR_PHA_8 (0x14)
+            // PHA[0] goes to bit 7 of ADDR_PHA_0_AMPG_AMPCC_AMPIC (0x15)
+            bool wasRunning = sampling_enabled;
+            if (wasRunning)
+              stop_sampling();
+            reinit_spi_software_mode();
+
+            uint16_t pha_value = value;                // value is already 0-511
+            uint8_t pha_8_1 = (pha_value >> 1) & 0xFF; // PHA[8:1]
+            uint8_t pha_0 = pha_value & 0x01;          // PHA[0]
+
+            // Write PHA[8:1] to ADDR_PHA_8
+            demod_write_reg(demod_reg_address::ADDR_PHA_8, pha_8_1);
+
+            // Read-modify-write ADDR_PHA_0_AMPG_AMPCC_AMPIC to set PHA[0] at bit 7
+            uint8_t current = demod_read_reg(demod_reg_address::ADDR_PHA_0_AMPG_AMPCC_AMPIC);
+            current = (current & 0x7F) | (pha_0 << 7); // Keep bits [6:0], set bit [7]
+            demod_write_reg(demod_reg_address::ADDR_PHA_0_AMPG_AMPCC_AMPIC, current);
+
+            reinit_spi_hw_adc_mode();
+            if (wasRunning)
+              start_sampling();
+            if (SerialUSB)
+            {
+              SerialUSB.print("PHA set to: ");
               SerialUSB.println(value);
             }
             return;
