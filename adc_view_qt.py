@@ -6,9 +6,12 @@ import warnings
 import numpy as np
 import serial
 from scipy.signal import butter, sosfilt
+from gpu_compute import GPUCompute
 
 # Suppress overflow warnings from pyqtgraph internals
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pyqtgraph')
+
+import threading
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -22,6 +25,133 @@ MAGIC = b"ADC\n"
 HDR_LEN = 10
 
 
+class SerialReaderThread(threading.Thread):
+    """Dedicated thread that continuously reads and parses serial data.
+    
+    Writes decoded samples directly into the shared ring buffer so the
+    main/GUI thread is never blocked waiting for serial I/O.  The ring
+    buffer arrays (ch1v, ch2v) are written with simple index stores and
+    numpy slice-assigns which are safe for a single-writer / single-reader
+    pattern without locks.
+    """
+
+    def __init__(self, ser, viewer):
+        super().__init__(daemon=True)
+        self.ser = ser
+        self.v = viewer          # reference to ADCViewer for shared state
+        self.rx = bytearray()
+        self._stop_event = threading.Event()
+        # Lock only for ser.write from main thread while we read
+        self.ser_lock = threading.Lock()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        MAGIC_LOCAL = MAGIC
+        HDR_LOCAL = HDR_LEN
+        v = self.v
+        ser = self.ser
+
+        while not self._stop_event.is_set():
+            try:
+                # Block up to 5 ms for data — keeps CPU usage low while
+                # still draining USB faster than the main timer could.
+                with self.ser_lock:
+                    waiting = ser.in_waiting
+                    if waiting > 0:
+                        chunk = ser.read(waiting)
+                    else:
+                        chunk = ser.read(1)  # blocks up to timeout
+                if not chunk:
+                    continue
+                self.rx.extend(chunk)
+            except Exception:
+                if self._stop_event.is_set():
+                    break
+                continue
+
+            # Trim buffer if too large
+            if len(self.rx) > 30000:
+                self.rx[:] = self.rx[-10000:]
+
+            # Check for text messages (lines not starting with 'ADC\n')
+            while b'\n' in self.rx:
+                newline_pos = self.rx.index(b'\n')
+                if newline_pos >= 3 and self.rx[newline_pos-3:newline_pos+1] == MAGIC_LOCAL:
+                    break
+                line_bytes = bytes(self.rx[:newline_pos])
+                del self.rx[:newline_pos + 1]
+                try:
+                    line_text = line_bytes.decode('utf-8', errors='ignore').strip()
+                    if line_text and not line_text.startswith('ADC'):
+                        v._last_arduino_msg = line_text
+                except Exception:
+                    pass
+
+            # Parse ADC packets
+            while True:
+                m = self.rx.find(MAGIC_LOCAL)
+                if m < 0:
+                    break
+                if m > 0:
+                    del self.rx[:m]
+                if len(self.rx) < HDR_LOCAL:
+                    break
+
+                count = struct.unpack_from("<H", self.rx, 8)[0]
+                payload_len = count * 4
+
+                if len(self.rx) < HDR_LOCAL + payload_len:
+                    break
+
+                payload = bytes(self.rx[HDR_LOCAL:HDR_LOCAL + payload_len])
+                del self.rx[:HDR_LOCAL + payload_len]
+
+                u16 = np.frombuffer(payload, dtype="<u2")
+                i16 = u16.view("<i2")
+                pairs = i16.reshape(-1, 2)
+
+                a1 = pairs[:, 0].astype(np.float32) * v.lsb
+                a2 = pairs[:, 1].astype(np.float32) * v.lsb
+
+                # Sample counting
+                n_samples = len(pairs)
+                v.sample_count_ch1 += n_samples
+                v.sample_count_ch2 += n_samples
+                v.total_samples_ch1 += n_samples
+                v.total_samples_ch2 += n_samples
+
+                # Decimate
+                d = max(1, v.decim)
+                a1 = a1[::d]
+                a2 = a2[::d]
+
+                # Write to ring buffer — bulk copy for speed
+                n = len(a1)
+                idx = v.write_idx
+                bs = v.buffer_size
+                end = idx + n
+                if end <= bs:
+                    v.ch1v[idx:end] = a1
+                    v.ch2v[idx:end] = a2
+                else:
+                    first = bs - idx
+                    v.ch1v[idx:bs] = a1[:first]
+                    v.ch2v[idx:bs] = a2[:first]
+                    rest = n - first
+                    v.ch1v[0:rest] = a1[first:]
+                    v.ch2v[0:rest] = a2[first:]
+                v.write_idx = (idx + n) % bs
+                v.data_count = min(v.data_count + n, bs)
+                v.k += n
+
+    def safe_write(self, data):
+        """Thread-safe serial write (called from main thread)."""
+        with self.ser_lock:
+            self.ser.write(data)
+
+
 class ADCViewer(QMainWindow):
     def __init__(self, port="COM5", sample_rate=30000, vref=5.0, decim=1, send_start=False):
         super().__init__()
@@ -29,8 +159,8 @@ class ADCViewer(QMainWindow):
         self.setGeometry(100, 100, 1400, 800)
         
         # Serial setup
-        self.ser = serial.Serial(port, baudrate=115200, timeout=0.01)
-        self.rx = bytearray()
+        self.ser = serial.Serial(port, baudrate=115200, timeout=0.005)
+        self._last_arduino_msg = None   # set by reader thread
         
         if send_start:
             time.sleep(0.2)
@@ -44,7 +174,7 @@ class ADCViewer(QMainWindow):
         self.fs_eff = sample_rate / max(1, decim)
         
         # Data buffers - use numpy ring buffer for performance
-        self.buffer_size = 50000
+        self.buffer_size = 500000
         self.ch1v = np.zeros(self.buffer_size, dtype=np.float32)
         self.ch2v = np.zeros(self.buffer_size, dtype=np.float32)
         self.write_idx = 0  # Current write position
@@ -151,11 +281,17 @@ class ADCViewer(QMainWindow):
         # SCD (Spectral Correlation Density) state
         self.scd_enabled = False
         self.scd_nfft = 1024  # FFT size for SCD
-        self.scd_noverlap = 512  # Overlap for SCD segments
-        self.scd_num_segments = 64  # Number of segments to average
+        self.scd_noverlap = 768  # Overlap for SCD segments (75%)
+        self.scd_overlap_pct = 75  # Overlap percentage
+        self.scd_num_segments = 128  # Number of segments to average
+        self.scd_alpha_step = 1  # Alpha bin step: 1=every bin, 2=even only
         self.scd_last_update = 0
         self.scd_update_interval = 0.5  # Update SCD every 500ms (slower than FFT)
         self.scd_data = None  # Cached SCD result
+
+        # GPU acceleration
+        self.gpu = GPUCompute()
+        self.use_gpu = self.gpu.available  # auto-enable if GPU found
         
         self.setup_ui()
         self.setup_timer()
@@ -276,17 +412,33 @@ class ADCViewer(QMainWindow):
         
         scd_controls.addWidget(QLabel("FFT:"))
         self.combo_scd_nfft = QComboBox()
-        self.combo_scd_nfft.addItems(["64", "128", "256", "512", "1024", "2048", "4096", "8192"])
+        self.combo_scd_nfft.addItems(["64", "128", "256", "512", "1024", "2048", "4096", "8192", "16384", "32768"])
         self.combo_scd_nfft.setCurrentText("1024")
         self.combo_scd_nfft.currentTextChanged.connect(self.on_scd_nfft_changed)
         scd_controls.addWidget(self.combo_scd_nfft)
         
         scd_controls.addWidget(QLabel("Segs:"))
         self.spin_scd_segments = QSpinBox()
-        self.spin_scd_segments.setRange(16, 256)
-        self.spin_scd_segments.setValue(64)
+        self.spin_scd_segments.setRange(8, 1024)
+        self.spin_scd_segments.setValue(128)
         self.spin_scd_segments.valueChanged.connect(self.on_scd_segments_changed)
         scd_controls.addWidget(self.spin_scd_segments)
+
+        scd_controls.addWidget(QLabel("Overlap:"))
+        self.combo_scd_overlap = QComboBox()
+        self.combo_scd_overlap.addItems(["50%", "75%", "87.5%"])
+        self.combo_scd_overlap.setCurrentText("75%")
+        self.combo_scd_overlap.setToolTip("Segment overlap — higher = more segments from same data, smoother result")
+        self.combo_scd_overlap.currentTextChanged.connect(self.on_scd_overlap_changed)
+        scd_controls.addWidget(self.combo_scd_overlap)
+
+        scd_controls.addWidget(QLabel("α step:"))
+        self.combo_scd_alpha_step = QComboBox()
+        self.combo_scd_alpha_step.addItems(["1 (fine)", "2 (fast)"])
+        self.combo_scd_alpha_step.setCurrentIndex(0)
+        self.combo_scd_alpha_step.setToolTip("Alpha bin step — 1 = full resolution (all bins), 2 = every other bin (2× faster)")
+        self.combo_scd_alpha_step.currentIndexChanged.connect(self.on_scd_alpha_step_changed)
+        scd_controls.addWidget(self.combo_scd_alpha_step)
         
         self.btn_scd_update = QPushButton("Update Now")
         self.btn_scd_update.setStyleSheet("background-color: #673AB7; color: white;")
@@ -315,11 +467,31 @@ class ADCViewer(QMainWindow):
         self.spin_scd_maxalpha.setSingleStep(50)
         scd_controls2.addWidget(self.spin_scd_maxalpha)
         
+        scd_controls2.addWidget(QLabel("Min dB:"))
+        self.spin_scd_min_db = QSpinBox()
+        self.spin_scd_min_db.setRange(-200, 0)
+        self.spin_scd_min_db.setValue(-60)
+        self.spin_scd_min_db.setSuffix(" dB")
+        self.spin_scd_min_db.setSingleStep(5)
+        self.spin_scd_min_db.setToolTip("Noise floor clamp — values below this are clipped for better contrast")
+        scd_controls2.addWidget(self.spin_scd_min_db)
+
         self.chk_scd_use_shifted = QCheckBox("Use Shifted Signal")
         self.chk_scd_use_shifted.setChecked(True)
         self.chk_scd_use_shifted.setToolTip("Apply freq shift and baseband filter to SCD")
         scd_controls2.addWidget(self.chk_scd_use_shifted)
-        
+
+        self.chk_scd_gpu = QCheckBox("GPU")
+        self.chk_scd_gpu.setChecked(self.use_gpu)
+        self.chk_scd_gpu.setEnabled(self.gpu.available)
+        self.chk_scd_gpu.setToolTip(self.gpu.status_string())
+        self.chk_scd_gpu.stateChanged.connect(lambda s: setattr(self, 'use_gpu', bool(s)))
+        scd_controls2.addWidget(self.chk_scd_gpu)
+
+        self.lbl_gpu_status = QLabel(self.gpu.status_string())
+        self.lbl_gpu_status.setStyleSheet("font-size: 9px; color: " + ("#4CAF50;" if self.gpu.available else "gray;"))
+        scd_controls2.addWidget(self.lbl_gpu_status)
+
         scd_controls2.addStretch()
         scd_layout.addLayout(scd_controls2)
         
@@ -334,7 +506,7 @@ class ADCViewer(QMainWindow):
         self.scd_plot.addItem(self.scd_image)
         
         # Add colorbar
-        self.scd_colorbar = pg.ColorBarItem(values=(0, 1), colorMap=pg.colormap.get('viridis'))
+        self.scd_colorbar = pg.ColorBarItem(values=(0, 1), colorMap=pg.colormap.get('turbo'))
         self.scd_colorbar.setImageItem(self.scd_image)
         
         scd_layout.addWidget(self.scd_plot)
@@ -380,11 +552,11 @@ class ADCViewer(QMainWindow):
         btn_layout = QHBoxLayout()
         self.btn_start = QPushButton("Start")
         self.btn_start.setStyleSheet("background-color: lightgreen; font-weight: bold;")
-        self.btn_start.clicked.connect(lambda: self.ser.write(b"S"))
+        self.btn_start.clicked.connect(lambda: self._reader.safe_write(b"S"))
         
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setStyleSheet("background-color: lightcoral; font-weight: bold;")
-        self.btn_stop.clicked.connect(lambda: self.ser.write(b"P"))
+        self.btn_stop.clicked.connect(lambda: self._reader.safe_write(b"P"))
         
         btn_layout.addWidget(self.btn_start)
         btn_layout.addWidget(self.btn_stop)
@@ -505,7 +677,7 @@ class ADCViewer(QMainWindow):
         
         self.btn_dvga_sweep = QPushButton("Sweep")
         self.btn_dvga_sweep.setStyleSheet("background-color: khaki;")
-        self.btn_dvga_sweep.clicked.connect(lambda: self.ser.write(b"G"))
+        self.btn_dvga_sweep.clicked.connect(lambda: self._reader.safe_write(b"G"))
         dvga_layout.addWidget(self.btn_dvga_sweep, 1, 0, 1, 3)
         
         control_layout.addWidget(dvga_group)
@@ -941,119 +1113,60 @@ class ADCViewer(QMainWindow):
     
     def send_dvga(self):
         val = self.spin_dvga.value()
-        self.ser.write(f"V{val}".encode())
+        self._reader.safe_write(f"V{val}".encode())
         print(f"Sent DVGA: {val}")
     
     def send_att(self):
         val = self.spin_att.value()
-        self.ser.write(f"A{val}".encode())
+        self._reader.safe_write(f"A{val}".encode())
         print(f"Sent ATT: {val}")
     
     def send_demod_reg(self, name, reg_id):
         val = self.demod_spins[name].value()
         cmd = f"D{reg_id}{val}"
-        self.ser.write(cmd.encode())
+        self._reader.safe_write(cmd.encode())
         print(f"Sent {name}: {val} (cmd={cmd})")
         self.msg_label.setText(f"Sent {name}={val}")
     
     def setup_timer(self):
+        # Start serial reader thread — runs independently of GUI
+        self._reader = SerialReaderThread(self.ser, self)
+        self._reader.start()
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.update)
-        self.timer.start(20)  # 50 Hz update
+        self.timer.start(20)  # 50 Hz GUI update
     
     def update(self):
-        self.read_serial()
+        # Pick up any text message from the reader thread
+        msg = self._last_arduino_msg
+        if msg is not None:
+            self._last_arduino_msg = None
+            print(f"[Arduino] {msg}")
+            self.msg_label.setText(msg)
+
         self.update_plots()
         self.update_status()
-    
-    def read_serial(self):
-        waiting = self.ser.in_waiting
-        if waiting > 0:
-            self.rx.extend(self.ser.read(waiting))
-        
-        # Trim buffer if too large
-        if len(self.rx) > 30000:
-            self.rx[:] = self.rx[-10000:]
-        
-        # Check for text messages (lines not starting with 'ADC\n')
-        while b'\n' in self.rx:
-            newline_pos = self.rx.index(b'\n')
-            # Check if this is NOT an ADC packet header
-            if newline_pos >= 3 and self.rx[newline_pos-3:newline_pos+1] == MAGIC:
-                break
-            # Extract the line as text
-            line_bytes = bytes(self.rx[:newline_pos])
-            del self.rx[:newline_pos + 1]
-            try:
-                line_text = line_bytes.decode('utf-8', errors='ignore').strip()
-                if line_text and not line_text.startswith('ADC'):
-                    print(f"[Arduino] {line_text}")
-                    self.msg_label.setText(line_text)
-            except:
-                pass
-        
-        # Parse ADC packets
-        while True:
-            m = self.rx.find(MAGIC)
-            if m < 0:
-                break
-            if m > 0:
-                del self.rx[:m]
-            if len(self.rx) < HDR_LEN:
-                break
-            
-            count = struct.unpack_from("<H", self.rx, 8)[0]
-            payload_len = count * 4
-            
-            if len(self.rx) < HDR_LEN + payload_len:
-                break
-            
-            payload = bytes(self.rx[HDR_LEN:HDR_LEN + payload_len])
-            del self.rx[:HDR_LEN + payload_len]
-            
-            u16 = np.frombuffer(payload, dtype="<u2")
-            i16 = u16.view("<i2")
-            pairs = i16.reshape(-1, 2)
-            
-            a1 = pairs[:, 0].astype(np.float32) * self.lsb
-            a2 = pairs[:, 1].astype(np.float32) * self.lsb
-            
-            # Count samples per ADC
-            n_samples = len(pairs)
-            self.sample_count_ch1 += n_samples  # Q channel (ADC1)
-            self.sample_count_ch2 += n_samples  # I channel (ADC2)
-            self.total_samples_ch1 += n_samples
-            self.total_samples_ch2 += n_samples
-            
-            # Decimate
-            d = max(1, self.decim)
-            a1 = a1[::d]
-            a2 = a2[::d]
-            
-            # Write to ring buffer (numpy array)
-            n = len(a1)
-            for i in range(n):
-                self.ch1v[self.write_idx] = a1[i]
-                self.ch2v[self.write_idx] = a2[i]
-                self.write_idx = (self.write_idx + 1) % self.buffer_size
-                self.data_count = min(self.data_count + 1, self.buffer_size)
-                self.k += 1
     
     def update_plots(self):
         if self.data_count < 2:
             return
         
-        win = min(self.spin_xwindow.value(), self.data_count)
+        # Snapshot ring buffer state (writer thread may update these at any time)
+        widx = self.write_idx
+        dcount = self.data_count
+        
+        win = min(self.spin_xwindow.value(), dcount)
         
         # Extract data from ring buffer (last 'win' samples)
-        if win <= self.write_idx:
-            y1 = self.ch1v[self.write_idx - win:self.write_idx].copy()
-            y2 = self.ch2v[self.write_idx - win:self.write_idx].copy()
+        if win <= widx:
+            y1 = self.ch1v[widx - win:widx].copy()
+            y2 = self.ch2v[widx - win:widx].copy()
         else:
             # Wrap around
-            part1_len = win - self.write_idx
-            y1 = np.concatenate([self.ch1v[self.buffer_size - part1_len:], self.ch1v[:self.write_idx]])
-            y2 = np.concatenate([self.ch2v[self.buffer_size - part1_len:], self.ch2v[:self.write_idx]])
+            part1_len = win - widx
+            y1 = np.concatenate([self.ch1v[self.buffer_size - part1_len:], self.ch1v[:widx]])
+            y2 = np.concatenate([self.ch2v[self.buffer_size - part1_len:], self.ch2v[:widx]])
         
         # Downsample for display if too many points
         if len(y1) > self.max_display_points:
@@ -1070,15 +1183,15 @@ class ADCViewer(QMainWindow):
         self.curve_ch2.setData(xs, y2_plot)
         
         # Calculate and display mean (using up to 8000 samples)
-        n_mean = min(8000, self.data_count)
+        n_mean = min(8000, dcount)
         if n_mean > 0:
-            if n_mean <= self.write_idx:
-                mean_ch1 = np.mean(self.ch1v[self.write_idx - n_mean:self.write_idx])
-                mean_ch2 = np.mean(self.ch2v[self.write_idx - n_mean:self.write_idx])
+            if n_mean <= widx:
+                mean_ch1 = np.mean(self.ch1v[widx - n_mean:widx])
+                mean_ch2 = np.mean(self.ch2v[widx - n_mean:widx])
             else:
-                part1_len = n_mean - self.write_idx
-                mean_ch1 = np.mean(np.concatenate([self.ch1v[self.buffer_size - part1_len:], self.ch1v[:self.write_idx]]))
-                mean_ch2 = np.mean(np.concatenate([self.ch2v[self.buffer_size - part1_len:], self.ch2v[:self.write_idx]]))
+                part1_len = n_mean - widx
+                mean_ch1 = np.mean(np.concatenate([self.ch1v[self.buffer_size - part1_len:], self.ch1v[:widx]]))
+                mean_ch2 = np.mean(np.concatenate([self.ch2v[self.buffer_size - part1_len:], self.ch2v[:widx]]))
             
             # Update mean lines
             self.mean_line_ch1.setValue(mean_ch1)
@@ -1102,7 +1215,7 @@ class ADCViewer(QMainWindow):
             return
         self.last_fft_update = now
         
-        fft_n = min(int(self.combo_fft.currentText()), self.data_count)
+        fft_n = min(int(self.combo_fft.currentText()), dcount)
         if fft_n >= 16:
             # Update FFT info
             obs_time = fft_n / self.fs_eff
@@ -1110,13 +1223,13 @@ class ADCViewer(QMainWindow):
             self.fft_info_label.setText(f"T_obs: {obs_time*1000:.1f} ms  |  Δf: {freq_res:.2f} Hz")
             
             # Extract FFT data from ring buffer
-            if fft_n <= self.write_idx:
-                y1_fft = self.ch1v[self.write_idx - fft_n:self.write_idx]
-                y2_fft = self.ch2v[self.write_idx - fft_n:self.write_idx]
+            if fft_n <= widx:
+                y1_fft = self.ch1v[widx - fft_n:widx].copy()
+                y2_fft = self.ch2v[widx - fft_n:widx].copy()
             else:
-                part1_len = fft_n - self.write_idx
-                y1_fft = np.concatenate([self.ch1v[self.buffer_size - part1_len:], self.ch1v[:self.write_idx]])
-                y2_fft = np.concatenate([self.ch2v[self.buffer_size - part1_len:], self.ch2v[:self.write_idx]])
+                part1_len = fft_n - widx
+                y1_fft = np.concatenate([self.ch1v[self.buffer_size - part1_len:], self.ch1v[:widx]])
+                y2_fft = np.concatenate([self.ch2v[self.buffer_size - part1_len:], self.ch2v[:widx]])
             
             # Apply DC filter if enabled
             if self.dc_filter_enabled:
@@ -1730,7 +1843,7 @@ class ADCViewer(QMainWindow):
         # Send the register command
         reg_id = '4' if reg_name == 'HD2QX' else '5'  # HD2QX=4, HD2QY=5
         cmd = f"D{reg_id}{value}"
-        self.ser.write(cmd.encode())
+        self._reader.safe_write(cmd.encode())
         print(f"[HD2 Optimize] Sent {reg_name}={value}")
         
         # Update display labels
@@ -2069,7 +2182,7 @@ class ADCViewer(QMainWindow):
         # Send the register command
         reg_id = '2' if reg_name == 'HD2IX' else '3'  # HD2IX=2, HD2IY=3
         cmd = f"D{reg_id}{value}"
-        self.ser.write(cmd.encode())
+        self._reader.safe_write(cmd.encode())
         print(f"[HD2I Optimize] Sent {reg_name}={value}")
         
         # Update display labels
@@ -2311,7 +2424,7 @@ class ADCViewer(QMainWindow):
     def send_iq_cal_reg(self, name, reg_id, value):
         """Send a PHA or GERR register value."""
         cmd = f"D{reg_id}{value}"
-        self.ser.write(cmd.encode())
+        self._reader.safe_write(cmd.encode())
         print(f"[IQ Cal] Sent {name}={value}")
         self.msg_label.setText(f"Sent {name}={value}")
     
@@ -2428,7 +2541,7 @@ class ADCViewer(QMainWindow):
             reg_id = 'A'
         
         cmd = f"D{reg_id}{value}"
-        self.ser.write(cmd.encode())
+        self._reader.safe_write(cmd.encode())
         print(f"[IQ Cal Optimize] Sent {reg_name}={value}")
         
         # Record current sample count for discarding
@@ -2888,13 +3001,25 @@ class ADCViewer(QMainWindow):
     def on_scd_nfft_changed(self, text):
         """Handle SCD FFT size change."""
         self.scd_nfft = int(text)
-        self.scd_noverlap = self.scd_nfft // 2
+        self.scd_noverlap = int(self.scd_nfft * self.scd_overlap_pct / 100)
         self.scd_data = None  # Clear cached data
     
     def on_scd_segments_changed(self, value):
         """Handle SCD segments change."""
         self.scd_num_segments = value
         self.scd_data = None  # Clear cached data
+
+    def on_scd_overlap_changed(self, text):
+        """Handle SCD overlap change."""
+        pct_map = {"50%": 50, "75%": 75, "87.5%": 87.5}
+        self.scd_overlap_pct = pct_map.get(text, 75)
+        self.scd_noverlap = int(self.scd_nfft * self.scd_overlap_pct / 100)
+        self.scd_data = None
+
+    def on_scd_alpha_step_changed(self, index):
+        """Handle alpha step change: 0 → step 1 (fine), 1 → step 2 (fast)."""
+        self.scd_alpha_step = 1 if index == 0 else 2
+        self.scd_data = None
     
     def compute_scd(self, complex_signal):
         """Compute Spectral Correlation Density using FFT Accumulation Method.
@@ -2908,6 +3033,7 @@ class ADCViewer(QMainWindow):
         - FFT-shifts first to work on symmetric [-Fs/2, Fs/2) grid
         - Uses only even alpha bin offsets so alpha/2 is integer bins
         - Avoids wrap-around by only correlating where both bins exist
+        - Optionally offloads cross-correlation to GPU via OpenCL
         
         Args:
             complex_signal: Complex I/Q signal (I + jQ)
@@ -2946,54 +3072,106 @@ class ADCViewer(QMainWindow):
         if len(ffts) == 0:
             return None, None, None
 
-        ffts = np.stack(ffts, axis=0)  # [S, N]
-        S = ffts.shape[0]
+        ffts = np.stack(ffts, axis=0).astype(np.complex64)  # [S, N]
 
-        # Use even bin offsets so alpha/2 is integer bins (no interpolation needed)
+        # Alpha bin offsets — step=1 gives full resolution, step=2 gives even-only
         max_m = N // 2
-        m_vals = np.arange(-max_m, max_m + 1, 2)  # even only
-        scd = np.zeros((len(m_vals), N), dtype=np.complex64)
+        step = self.scd_alpha_step
+        if step == 1:
+            # Full resolution: all integer offsets
+            m_vals = np.arange(-max_m, max_m + 1, 1, dtype=np.int32)
+        else:
+            # Even only (alpha/2 stays integer → no interpolation)
+            m_vals = np.arange(-max_m, max_m + 1, 2, dtype=np.int32)
 
-        for ai, m in enumerate(m_vals):
-            mh = m // 2  # half the cyclic frequency offset in bins
-            # Valid k indices where k+mh and k-mh are both in [0, N-1]
-            # Need: 0 <= k+mh < N  AND  0 <= k-mh < N
-            # This gives: k in [|mh|, N-|mh|)
-            abs_mh = abs(mh)
-            k0 = abs_mh
-            k1 = N - abs_mh
-            if k1 <= k0:
-                continue  # No valid indices for this alpha
-            # X(f + alpha/2) and X*(f - alpha/2)
-            Xp = ffts[:, k0 + mh:k1 + mh]  # f + alpha/2
-            Xm = ffts[:, k0 - mh:k1 - mh]  # f - alpha/2
-            scd[ai, k0:k1] = np.mean(Xp * np.conj(Xm), axis=0)
+        # ── GPU path ──
+        if self.use_gpu and self.gpu.available:
+            try:
+                t0 = time.perf_counter()
+                scd_mag = self.gpu.compute_scd_gpu(ffts, m_vals, N)
+                self._scd_gpu_ms = (time.perf_counter() - t0) * 1000
+                self._scd_backend = "GPU"
+            except Exception as e:
+                print(f"GPU SCD failed, falling back to CPU: {e}")
+                scd_mag = self._compute_scd_cpu(ffts, m_vals, N)
+        else:
+            t0 = time.perf_counter()
+            scd_mag = self._compute_scd_cpu(ffts, m_vals, N)
+            self._scd_gpu_ms = (time.perf_counter() - t0) * 1000
+            self._scd_backend = "CPU"
 
         # Frequency axis (already shifted)
         freqs = np.fft.fftshift(np.fft.fftfreq(N, d=1.0 / self.fs_eff))
         # Alpha (cyclic frequency) axis
         alphas = m_vals * (self.fs_eff / N)
         
-        return np.abs(scd).astype(np.float32), freqs, alphas
+        return scd_mag, freqs, alphas
+
+    def _compute_scd_cpu(self, ffts, m_vals, N):
+        """CPU fallback for SCD cross-correlation.
+        
+        Supports both even m (integer half-offset) and odd m (linear
+        interpolation between adjacent bins).
+        """
+        S = ffts.shape[0]
+        scd = np.zeros((len(m_vals), N), dtype=np.complex64)
+
+        for ai, m in enumerate(m_vals):
+            m_int = int(m)
+            if m_int % 2 == 0:
+                # Even: alpha/2 is integer bins → exact
+                mh = m_int // 2
+                abs_mh = abs(mh)
+                k0 = abs_mh
+                k1 = N - abs_mh
+                if k1 <= k0:
+                    continue
+                Xp = ffts[:, k0 + mh:k1 + mh]
+                Xm = ffts[:, k0 - mh:k1 - mh]
+                scd[ai, k0:k1] = np.mean(Xp * np.conj(Xm), axis=0)
+            else:
+                # Odd: alpha/2 = (m±1)/2 + 0.5 → interpolate
+                mh_lo = m_int // 2       # floor
+                mh_hi = mh_lo + 1 if m_int > 0 else mh_lo - 1  # ceil away from 0
+                # Actually simpler: for odd m, half = m/2.0
+                # Interpolate: X(k + m/2) ≈ 0.5*(X(k+floor) + X(k+ceil))
+                mh_floor = m_int // 2
+                mh_ceil = mh_floor + (1 if m_int > 0 else -1)
+                abs_max = max(abs(mh_floor), abs(mh_ceil))
+                k0 = abs_max
+                k1 = N - abs_max
+                if k1 <= k0:
+                    continue
+                Xp = 0.5 * (ffts[:, k0 + mh_floor:k1 + mh_floor] +
+                            ffts[:, k0 + mh_ceil:k1 + mh_ceil])
+                Xm = 0.5 * (ffts[:, k0 - mh_floor:k1 - mh_floor] +
+                            ffts[:, k0 - mh_ceil:k1 - mh_ceil])
+                scd[ai, k0:k1] = np.mean(Xp * np.conj(Xm), axis=0)
+
+        return np.abs(scd).astype(np.float32)
     
     def update_scd_plot(self):
         """Compute and update the SCD plot."""
-        if self.data_count < self.scd_nfft * 2:
+        # Snapshot ring buffer state (writer thread may update at any time)
+        widx = self.write_idx
+        dcount = self.data_count
+        
+        if dcount < self.scd_nfft * 2:
             self.scd_info_label.setText("SCD: Not enough samples")
             return
         
         # Get samples needed for SCD
         total_samples = self.scd_nfft + (self.scd_num_segments - 1) * (self.scd_nfft - self.scd_noverlap)
-        total_samples = min(total_samples, self.data_count)
+        total_samples = min(total_samples, dcount)
         
-        # Extract data from ring buffer
-        if total_samples <= self.write_idx:
-            i_data = self.ch2v[self.write_idx - total_samples:self.write_idx]
-            q_data = self.ch1v[self.write_idx - total_samples:self.write_idx]
+        # Extract data from ring buffer using snapshot
+        if total_samples <= widx:
+            i_data = self.ch2v[widx - total_samples:widx].copy()
+            q_data = self.ch1v[widx - total_samples:widx].copy()
         else:
-            part1_len = total_samples - self.write_idx
-            i_data = np.concatenate([self.ch2v[self.buffer_size - part1_len:], self.ch2v[:self.write_idx]])
-            q_data = np.concatenate([self.ch1v[self.buffer_size - part1_len:], self.ch1v[:self.write_idx]])
+            part1_len = total_samples - widx
+            i_data = np.concatenate([self.ch2v[self.buffer_size - part1_len:], self.ch2v[:widx]])
+            q_data = np.concatenate([self.ch1v[self.buffer_size - part1_len:], self.ch1v[:widx]])
         
         # Apply DC filter if enabled
         if self.dc_filter_enabled:
@@ -3029,8 +3207,10 @@ class ADCViewer(QMainWindow):
         # Convert to dB
         scd_db = 20 * np.log10(np.maximum(scd, 1e-10))
         
-        # Normalize for display
-        scd_min = np.min(scd_db)
+        # Clamp to user-specified noise floor
+        floor_db = float(self.spin_scd_min_db.value())
+        scd_db = np.clip(scd_db, floor_db, None)
+        scd_min = floor_db
         scd_max = np.max(scd_db)
         
         # Update image
@@ -3052,13 +3232,20 @@ class ADCViewer(QMainWindow):
         
         # Build info text
         shifted_str = "(shifted)" if self.chk_scd_use_shifted.isChecked() and self.freq_shift_enabled else ""
+        backend_str = getattr(self, '_scd_backend', 'CPU')
+        ms_str = f"{getattr(self, '_scd_gpu_ms', 0):.1f}ms"
+        delta_f = self.fs_eff / self.scd_nfft
+        delta_alpha = delta_f * self.scd_alpha_step
         
         # Update info label
         self.scd_info_label.setText(
-            f"SCD: {self.scd_nfft}-pt FFT, {self.scd_num_segments} segs {shifted_str} | "
+            f"SCD: {self.scd_nfft}-pt FFT, {self.scd_num_segments} segs, "
+            f"{self.scd_overlap_pct:.0f}% overlap {shifted_str} | "
+            f"Δf={delta_f:.2f} Hz, Δα={delta_alpha:.2f} Hz | "
             f"f: ±{fmax_scd:.0f} Hz | "
             f"α: ±{alpha_max_scd:.0f} Hz | "
-            f"Range: [{scd_min:.1f}, {scd_max:.1f}] dB"
+            f"[{scd_min:.1f}, {scd_max:.1f}] dB | "
+            f"{backend_str} {ms_str}"
         )
         
         self.scd_last_update = time.time()
@@ -3507,6 +3694,10 @@ class ADCViewer(QMainWindow):
             self.iq_cal_optimize_timer.stop()
         if self.dsp_cal_optimize_timer:
             self.dsp_cal_optimize_timer.stop()
+        # Stop reader thread before closing serial port
+        if hasattr(self, '_reader'):
+            self._reader.stop()
+            self._reader.join(timeout=1.0)
         self.ser.close()
         event.accept()
 

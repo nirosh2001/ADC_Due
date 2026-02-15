@@ -1,2 +1,3 @@
 python adc_view.py --port COM13 --vref 5 --decim 1 --send_start
+ & D:/FYP/ADC_Due/.venv/Scripts/Activate.ps1
 .\.venv\Scripts\python.exe adc_view_qt.py --port COM11 --vref 5 --decim 1 --send_start
