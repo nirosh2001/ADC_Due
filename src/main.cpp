@@ -547,6 +547,14 @@ void setup()
     dvga_init_serial();
   }
 
+  // RFSW and LNA control
+  pinMode(RFSW, OUTPUT);
+  pinMode(LNA_1, OUTPUT);
+  pinMode(LNA_2, OUTPUT);
+  digitalWrite(RFSW, HIGH);  // Turn on RFSW
+  digitalWrite(LNA_1, HIGH); // LNA_1 HIGH
+  digitalWrite(LNA_2, LOW);  // LNA_2 LOW
+
   SPI.begin();
 
   demod_init();

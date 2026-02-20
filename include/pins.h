@@ -48,4 +48,7 @@
 #define DVGAI_D4 42
 #define DVGAI_D5 41
 
+#define LNA_1 28
+#define LNA_2 29
+
 #endif

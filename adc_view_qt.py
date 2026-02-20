@@ -1,8 +1,10 @@
 import sys
+import os
 import time
 import struct
 import argparse
 import warnings
+from datetime import datetime
 import numpy as np
 import serial
 from scipy.signal import butter, sosfilt
@@ -16,7 +18,8 @@ import threading
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QSlider, QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
-    QGridLayout, QTabWidget, QComboBox, QProgressBar, QCheckBox
+    QGridLayout, QTabWidget, QComboBox, QProgressBar, QCheckBox, QLineEdit,
+    QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 import pyqtgraph as pg
@@ -494,7 +497,39 @@ class ADCViewer(QMainWindow):
 
         scd_controls2.addStretch()
         scd_layout.addLayout(scd_controls2)
-        
+
+        # SCD Dataset Save controls (third row)
+        scd_dataset_controls = QHBoxLayout()
+
+        scd_dataset_controls.addWidget(QLabel("Drone Name:"))
+        self.edit_drone_name = QLineEdit()
+        self.edit_drone_name.setPlaceholderText("e.g. DJI Mavic 3")
+        self.edit_drone_name.setMinimumWidth(100)
+        scd_dataset_controls.addWidget(self.edit_drone_name)
+
+        scd_dataset_controls.addWidget(QLabel("Drone Type:"))
+        self.edit_drone_type = QLineEdit()
+        self.edit_drone_type.setPlaceholderText("e.g. Quadcopter")
+        self.edit_drone_type.setMinimumWidth(100)
+        scd_dataset_controls.addWidget(self.edit_drone_type)
+
+        scd_dataset_controls.addWidget(QLabel("Distance (m):"))
+        self.spin_distance = QDoubleSpinBox()
+        self.spin_distance.setRange(0.0, 99999.0)
+        self.spin_distance.setValue(10.0)
+        self.spin_distance.setSingleStep(0.5)
+        self.spin_distance.setDecimals(2)
+        self.spin_distance.setSuffix(" m")
+        scd_dataset_controls.addWidget(self.spin_distance)
+
+        self.btn_save_scd = QPushButton("Save SCD Dataset")
+        self.btn_save_scd.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 4px 12px;")
+        self.btn_save_scd.clicked.connect(self.save_scd_dataset)
+        scd_dataset_controls.addWidget(self.btn_save_scd)
+
+        scd_dataset_controls.addStretch()
+        scd_layout.addLayout(scd_dataset_controls)
+
         # SCD 2D plot using ImageView
         self.scd_plot = pg.PlotWidget(title="Spectral Correlation Density")
         self.scd_plot.setLabel('left', 'Cyclic Frequency α (Hz)')
@@ -2988,6 +3023,134 @@ class ADCViewer(QMainWindow):
         # Apply the filter
         return sosfilt(self.dc_filter_sos, data).astype(np.float32)
     
+    # ========== SCD Dataset Save ==========
+
+    def save_scd_dataset(self):
+        """Save the current SCD pattern as image + text data, plus a settings text file.
+        
+        Folder structure: D:/FYP/Dataset/<drone_name>/<drone_type>/<distance_m>/<session_timestamp>/
+        """
+        if self.scd_data is None:
+            QMessageBox.warning(self, "No SCD Data", "No SCD data available. Enable SCD and click 'Update Now' first.")
+            return
+
+        drone_name = self.edit_drone_name.text().strip()
+        drone_type = self.edit_drone_type.text().strip()
+        distance = self.spin_distance.value()
+
+        if not drone_name:
+            QMessageBox.warning(self, "Missing Field", "Please enter a Drone Name.")
+            return
+        if not drone_type:
+            QMessageBox.warning(self, "Missing Field", "Please enter a Drone Type.")
+            return
+
+        # Sanitize folder names (replace invalid chars)
+        def sanitize(name):
+            return "".join(c if c.isalnum() or c in (' ', '-', '_', '.') else '_' for c in name).strip()
+
+        drone_name_safe = sanitize(drone_name)
+        drone_type_safe = sanitize(drone_type)
+        distance_str = f"{distance:.2f}m"
+        now = datetime.now()
+        session_stamp = now.strftime("%Y%m%d_%H%M%S")
+
+        base_path = os.path.join("D:", os.sep, "FYP", "Dataset")
+        folder = os.path.join(base_path, drone_name_safe, drone_type_safe, distance_str, session_stamp)
+        os.makedirs(folder, exist_ok=True)
+
+        # --- 1. Save SCD data as text file ---
+        scd_txt_path = os.path.join(folder, "scd_data.txt")
+        np.savetxt(scd_txt_path, self.scd_data, fmt="%.6f", delimiter="\t")
+
+        # --- 2. Save SCD plot as image ---
+        scd_img_path = os.path.join(folder, "scd_pattern.png")
+        try:
+            import pyqtgraph.exporters as exporters
+            exporter = exporters.ImageExporter(self.scd_plot.plotItem)
+            exporter.parameters()['width'] = 1920
+            exporter.export(scd_img_path)
+        except Exception as e:
+            # Fallback: grab the widget as an image
+            try:
+                pixmap = self.scd_plot.grab()
+                pixmap.save(scd_img_path, "PNG")
+            except Exception as e2:
+                QMessageBox.warning(self, "Image Save Error", f"Could not save image: {e2}")
+
+        # --- 3. Save settings text file ---
+        settings_path = os.path.join(folder, "settings.txt")
+        with open(settings_path, "w", encoding="utf-8") as f:
+            f.write("=" * 60 + "\n")
+            f.write("  SCD Dataset Capture Settings\n")
+            f.write("=" * 60 + "\n\n")
+
+            f.write(f"Date & Time       : {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Drone Name        : {drone_name}\n")
+            f.write(f"Drone Type        : {drone_type}\n")
+            f.write(f"Distance to Object: {distance:.2f} m\n\n")
+
+            f.write("--- ADC Settings ---\n")
+            f.write(f"Sample Rate       : {self.sample_rate} Hz\n")
+            f.write(f"Effective Fs      : {self.fs_eff} Hz\n")
+            f.write(f"VREF              : {self.vref} V\n")
+            f.write(f"Decimation        : {self.decim}\n")
+            f.write(f"Total Samples     : {self.data_count}\n\n")
+
+            f.write("--- SCD Settings ---\n")
+            f.write(f"SCD Enabled       : {self.scd_enabled}\n")
+            f.write(f"FFT Size (NFFT)   : {self.scd_nfft}\n")
+            f.write(f"Segments          : {self.scd_num_segments}\n")
+            f.write(f"Overlap           : {self.scd_overlap_pct}%\n")
+            f.write(f"Alpha Step        : {self.scd_alpha_step}\n")
+            f.write(f"Max Freq Display  : {self.spin_scd_maxfreq.value()} Hz\n")
+            f.write(f"Max Alpha Display : {self.spin_scd_maxalpha.value()} Hz\n")
+            f.write(f"Min dB Floor      : {self.spin_scd_min_db.value()} dB\n")
+            f.write(f"Use Shifted Signal: {self.chk_scd_use_shifted.isChecked()}\n")
+            f.write(f"GPU Enabled       : {self.chk_scd_gpu.isChecked()}\n\n")
+
+            f.write("--- Display / Filter Settings ---\n")
+            f.write(f"X Window          : {self.spin_xwindow.value()}\n")
+            f.write(f"Y Range           : ±{self.spin_yrange.value()} V\n")
+            f.write(f"Max Freq (FFT)    : {self.spin_maxfreq.value()} Hz\n")
+            f.write(f"FFT Size (display): {self.combo_fft.currentText()}\n")
+            f.write(f"DC Filter Enabled : {self.dc_filter_enabled}\n")
+            f.write(f"BP 2500Hz Filter  : {self.bp_2500hz_filter_enabled}\n")
+            f.write(f"Freq Shift Enabled: {self.freq_shift_enabled}\n")
+            f.write(f"Freq Shift Hz     : {self.freq_shift_hz}\n")
+            f.write(f"BB DC Block       : {self.bb_filter_enabled}\n")
+            f.write(f"BB Cutoff         : {self.bb_filter_cutoff} Hz\n")
+            f.write(f"Notch Filter      : {self.notch_filter_enabled}\n")
+            f.write(f"Notch Freq        : {self.notch_filter_freq} Hz\n")
+            f.write(f"Notch BW          : {self.notch_filter_bw} Hz\n\n")
+
+            f.write("--- DVGA / Attenuator ---\n")
+            f.write(f"DVGA Gain         : {self.spin_dvga.value()}\n")
+            f.write(f"Attenuator        : {self.spin_att.value()}\n\n")
+
+            f.write("--- DSP Calibration ---\n")
+            f.write(f"DSP Gain          : {self.dsp_gain}\n")
+            f.write(f"DSP Phase         : {self.dsp_phase}°\n\n")
+
+            f.write("--- Demodulator Registers ---\n")
+            for name, spin in self.demod_spins.items():
+                f.write(f"{name:18s}: {spin.value()}\n")
+            f.write("\n")
+
+            f.write("=" * 60 + "\n")
+            f.write("  End of Settings\n")
+            f.write("=" * 60 + "\n")
+
+        # Show success
+        self.scd_info_label.setText(f"SCD: Saved to {folder}")
+        QMessageBox.information(self, "Dataset Saved",
+            f"SCD dataset saved successfully!\n\n"
+            f"Folder: {folder}\n\n"
+            f"Files:\n"
+            f"  • scd_data.txt (numeric data)\n"
+            f"  • scd_pattern.png (image)\n"
+            f"  • settings.txt (all settings)")
+
     # ========== Spectral Correlation Density (SCD) ==========
     
     def on_scd_enable_toggled(self, state):
