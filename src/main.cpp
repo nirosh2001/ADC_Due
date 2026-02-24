@@ -860,6 +860,28 @@ void loop()
         }
       }
     }
+    else if (c == 'L')
+    {
+      // LNA control: format "L<value>"
+      // value bit 0 = LNA_1, bit 1 = LNA_2  (1=ON, 0=OFF)
+      uint32_t timeout = millis() + 100;
+      while (!SerialUSB.available() && millis() < timeout)
+      {
+      }
+      if (SerialUSB.available())
+      {
+        uint8_t lnaVal = (uint8_t)SerialUSB.parseInt();
+        digitalWrite(LNA_1, (lnaVal & 0x01) ? HIGH : LOW);
+        digitalWrite(LNA_2, (lnaVal & 0x02) ? HIGH : LOW);
+        if (SerialUSB)
+        {
+          SerialUSB.print("LNA1=");
+          SerialUSB.print((lnaVal & 0x01) ? "ON" : "OFF");
+          SerialUSB.print(" LNA2=");
+          SerialUSB.println((lnaVal & 0x02) ? "ON" : "OFF");
+        }
+      }
+    }
   }
 
   switch (currentState)

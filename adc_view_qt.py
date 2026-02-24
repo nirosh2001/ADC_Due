@@ -734,6 +734,22 @@ class ADCViewer(QMainWindow):
         
         control_layout.addWidget(att_group)
         
+        # --- LNA Control ---
+        lna_group = QGroupBox("LNA Control")
+        lna_layout = QGridLayout(lna_group)
+        
+        self.chk_lna1 = QCheckBox("LNA 1")
+        self.chk_lna1.setChecked(True)  # Matches firmware default (HIGH)
+        self.chk_lna1.stateChanged.connect(self.send_lna)
+        lna_layout.addWidget(self.chk_lna1, 0, 0)
+        
+        self.chk_lna2 = QCheckBox("LNA 2")
+        self.chk_lna2.setChecked(False)  # Matches firmware default (LOW)
+        self.chk_lna2.stateChanged.connect(self.send_lna)
+        lna_layout.addWidget(self.chk_lna2, 0, 1)
+        
+        control_layout.addWidget(lna_group)
+        
         # --- Arduino Messages ---
         msg_group = QGroupBox("Arduino Messages")
         msg_layout = QVBoxLayout(msg_group)
@@ -1155,6 +1171,14 @@ class ADCViewer(QMainWindow):
         val = self.spin_att.value()
         self._reader.safe_write(f"A{val}".encode())
         print(f"Sent ATT: {val}")
+    
+    def send_lna(self):
+        val = (1 if self.chk_lna1.isChecked() else 0) | (2 if self.chk_lna2.isChecked() else 0)
+        self._reader.safe_write(f"L{val}".encode())
+        lna1_str = "ON" if self.chk_lna1.isChecked() else "OFF"
+        lna2_str = "ON" if self.chk_lna2.isChecked() else "OFF"
+        print(f"Sent LNA: LNA1={lna1_str} LNA2={lna2_str}")
+        self.msg_label.setText(f"LNA1={lna1_str} LNA2={lna2_str}")
     
     def send_demod_reg(self, name, reg_id):
         val = self.demod_spins[name].value()
