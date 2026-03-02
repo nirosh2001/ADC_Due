@@ -440,7 +440,7 @@ class ADCViewer(QMainWindow):
         scd_controls.addWidget(QLabel("α step:"))
         self.combo_scd_alpha_step = QComboBox()
         self.combo_scd_alpha_step.addItems(["1 (fine)", "2 (fast)"])
-        self.combo_scd_alpha_step.setCurrentIndex(0)
+        self.combo_scd_alpha_step.setCurrentIndex(1)  # Default to fast mode
         self.combo_scd_alpha_step.setToolTip("Alpha bin step — 1 = full resolution (all bins), 2 = every other bin (2× faster)")
         self.combo_scd_alpha_step.currentIndexChanged.connect(self.on_scd_alpha_step_changed)
         scd_controls.addWidget(self.combo_scd_alpha_step)
@@ -3081,9 +3081,20 @@ class ADCViewer(QMainWindow):
         now = datetime.now()
         session_stamp = now.strftime("%Y%m%d_%H%M%S")
 
-        base_path = os.path.join("D:", os.sep, "FYP", "Dataset")
+        # Use Documents folder (user always has write access)
+        base_path = os.path.join(os.path.expanduser("~"), "Documents", "FYP_Dataset")
         folder = os.path.join(base_path, drone_name_safe, drone_type_safe, distance_str, session_stamp)
-        os.makedirs(folder, exist_ok=True)
+        
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except PermissionError as e:
+            # Fallback: save in current working directory
+            base_path = os.path.join(os.getcwd(), "SCD_Dataset")
+            folder = os.path.join(base_path, drone_name_safe, drone_type_safe, distance_str, session_stamp)
+            os.makedirs(folder, exist_ok=True)
+            QMessageBox.warning(self, "Permission Error", 
+                f"Could not save to default location.\nUsing: {base_path}")
+
 
         # --- 1. Save SCD data as compressed binary (.npz) ---
         scd_npy_path = os.path.join(folder, "scd_data.npz")
@@ -3216,6 +3227,21 @@ class ADCViewer(QMainWindow):
         self.scd_alpha_step = 1 if index == 0 else 2
         self.scd_data = None
     
+    def _compute_ffts_cpu(self, signal, window, N, L, num_segs):
+        """CPU fallback for FFT computation."""
+        ffts = []
+        for i in range(num_segs):
+            start = i * (N - L)
+            seg = signal[start:start + N]
+            if len(seg) < N:
+                break
+            X = np.fft.fftshift(np.fft.fft(seg * window))
+            ffts.append(X)
+        
+        if len(ffts) == 0:
+            return None
+        return np.stack(ffts, axis=0).astype(np.complex64)
+    
     def compute_scd(self, complex_signal):
         """Compute Spectral Correlation Density using FFT Accumulation Method.
         
@@ -3254,20 +3280,43 @@ class ADCViewer(QMainWindow):
         if num_segs < 1:
             return None, None, None
 
-        # Compute FFTs for each segment, apply fftshift immediately
-        ffts = []
-        for i in range(num_segs):
-            start = i * (N - L)
-            seg = signal[start:start + N]
-            if len(seg) < N:
-                break
-            X = np.fft.fftshift(np.fft.fft(seg * window))
-            ffts.append(X)
+        # ── GPU FFT path (if supported) ──
+        if self.use_gpu and self.gpu.available and self.gpu.supports_fft:
+            try:
+                # Extract segments
+                segments = []
+                for i in range(num_segs):
+                    start = i * (N - L)
+                    seg = signal[start:start + N]
+                    if len(seg) < N:
+                        break
+                    segments.append(seg)
+                
+                if len(segments) == 0:
+                    return None, None, None
+                
+                segments_array = np.stack(segments, axis=0).astype(np.complex64)
+                
+                # Compute batch FFT on GPU (includes windowing and fftshift)
+                ffts = self.gpu.compute_fft_batch_gpu(segments_array, window)
+                
+                if ffts is not None:
+                    self._fft_backend = "GPU"
+                else:
+                    # GPU FFT failed, fallback to CPU
+                    ffts = self._compute_ffts_cpu(signal, window, N, L, num_segs)
+                    self._fft_backend = "CPU"
+            except Exception as e:
+                print(f"GPU FFT failed: {e}, falling back to CPU")
+                ffts = self._compute_ffts_cpu(signal, window, N, L, num_segs)
+                self._fft_backend = "CPU"
+        else:
+            # CPU FFT path
+            ffts = self._compute_ffts_cpu(signal, window, N, L, num_segs)
+            self._fft_backend = "CPU"
         
-        if len(ffts) == 0:
+        if ffts is None or len(ffts) == 0:
             return None, None, None
-
-        ffts = np.stack(ffts, axis=0).astype(np.complex64)  # [S, N]
 
         # Alpha bin offsets — step=1 gives full resolution, step=2 gives even-only
         max_m = N // 2
@@ -3427,7 +3476,8 @@ class ADCViewer(QMainWindow):
         
         # Build info text
         shifted_str = "(shifted)" if self.chk_scd_use_shifted.isChecked() and self.freq_shift_enabled else ""
-        backend_str = getattr(self, '_scd_backend', 'CPU')
+        fft_backend = getattr(self, '_fft_backend', 'CPU')
+        scd_backend = getattr(self, '_scd_backend', 'CPU')
         ms_str = f"{getattr(self, '_scd_gpu_ms', 0):.1f}ms"
         delta_f = self.fs_eff / self.scd_nfft
         delta_alpha = delta_f * self.scd_alpha_step
@@ -3440,7 +3490,7 @@ class ADCViewer(QMainWindow):
             f"f: ±{fmax_scd:.0f} Hz | "
             f"α: ±{alpha_max_scd:.0f} Hz | "
             f"[{scd_min:.1f}, {scd_max:.1f}] dB | "
-            f"{backend_str} {ms_str}"
+            f"FFT:{fft_backend} SCD:{scd_backend} {ms_str}"
         )
         
         self.scd_last_update = time.time()
