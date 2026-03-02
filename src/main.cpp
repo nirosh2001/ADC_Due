@@ -248,7 +248,7 @@ constexpr uint8_t CS2_PIN = 4;    // SPI CS1 (hardware)
 
 // --- Timing targets (30 kHz sample rate) ---
 constexpr uint32_t CONVST_LOW_NS = 100;
-constexpr uint32_t CONVST_HIGH_NS = 33200; // 33.3us total period => 30kSPS
+constexpr uint32_t CONVST_HIGH_NS = 62400; // 62.5us total period => 16kSPS
 constexpr uint32_t TCONV_MAX_NS = 8800;    // ADS8867 tconv max
 
 // SPI clock

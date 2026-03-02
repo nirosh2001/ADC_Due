@@ -156,7 +156,7 @@ class SerialReaderThread(threading.Thread):
 
 
 class ADCViewer(QMainWindow):
-    def __init__(self, port="COM5", sample_rate=30000, vref=5.0, decim=1, send_start=False):
+    def __init__(self, port="COM5", sample_rate=16000, vref=5.0, decim=1, send_start=False):
         super().__init__()
         self.setWindowTitle("ADC Viewer")
         self.setGeometry(100, 100, 1400, 800)
@@ -291,6 +291,8 @@ class ADCViewer(QMainWindow):
         self.scd_last_update = 0
         self.scd_update_interval = 0.5  # Update SCD every 500ms (slower than FFT)
         self.scd_data = None  # Cached SCD result
+        self.scd_raw_i = None  # Raw I-channel data used for SCD
+        self.scd_raw_q = None  # Raw Q-channel data used for SCD
 
         # GPU acceleration
         self.gpu = GPUCompute()
@@ -3083,9 +3085,14 @@ class ADCViewer(QMainWindow):
         folder = os.path.join(base_path, drone_name_safe, drone_type_safe, distance_str, session_stamp)
         os.makedirs(folder, exist_ok=True)
 
-        # --- 1. Save SCD data as text file ---
-        scd_txt_path = os.path.join(folder, "scd_data.txt")
-        np.savetxt(scd_txt_path, self.scd_data, fmt="%.6f", delimiter="\t")
+        # --- 1. Save SCD data as compressed binary (.npz) ---
+        scd_npy_path = os.path.join(folder, "scd_data.npz")
+        np.savez_compressed(scd_npy_path, scd=self.scd_data)
+
+        # --- 1b. Save raw ADC I/Q data used for SCD ---
+        if self.scd_raw_i is not None and self.scd_raw_q is not None:
+            raw_path = os.path.join(folder, "raw_iq_data.npz")
+            np.savez_compressed(raw_path, i_channel=self.scd_raw_i, q_channel=self.scd_raw_q)
 
         # --- 2. Save SCD plot as image ---
         scd_img_path = os.path.join(folder, "scd_pattern.png")
@@ -3171,7 +3178,8 @@ class ADCViewer(QMainWindow):
             f"SCD dataset saved successfully!\n\n"
             f"Folder: {folder}\n\n"
             f"Files:\n"
-            f"  • scd_data.txt (numeric data)\n"
+            f"  • scd_data.npz (numeric data)\n"
+            f"  • raw_iq_data.npz (raw ADC I/Q data)\n"
             f"  • scd_pattern.png (image)\n"
             f"  • settings.txt (all settings)")
 
@@ -3437,6 +3445,8 @@ class ADCViewer(QMainWindow):
         
         self.scd_last_update = time.time()
         self.scd_data = scd_db
+        self.scd_raw_i = i_data.copy()
+        self.scd_raw_q = q_data.copy()
     
     def compute_iq_gain_phase_diff(self, i_data, q_data, fft_n=4096):
         """Compute gain ratio and phase difference between I and Q channels.
@@ -3894,7 +3904,7 @@ def main():
     ap.add_argument("--port", default="COM5", help="COMx or /dev/ttyACM0")
     ap.add_argument("--vref", type=float, default=5, help="VREF in volts")
     ap.add_argument("--decim", type=int, default=1, help="plot every Nth sample")
-    ap.add_argument("--sample_rate", type=float, default=30000, help="ADC sample rate in Hz")
+    ap.add_argument("--sample_rate", type=float, default=16000, help="ADC sample rate in Hz")
     ap.add_argument("--send_start", action="store_true", help="send 'S' to start sampling")
     args = ap.parse_args()
     
