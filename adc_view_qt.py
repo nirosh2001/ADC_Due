@@ -335,6 +335,16 @@ class ADCViewer(QMainWindow):
         self.mean_text_ch2 = pg.TextItem(anchor=(0, 1), color='r')
         self.plot_ch2.addItem(self.mean_text_ch2)
         
+        # IQ Phase time-domain plot
+        self.plot_iq_phase = pg.PlotWidget(title="IQ Phase")
+        self.plot_iq_phase.setLabel('left', 'Phase (°)')
+        self.plot_iq_phase.showGrid(x=True, y=True)
+        self.plot_iq_phase.disableAutoRange()
+        self.curve_iq_phase = self.plot_iq_phase.plot(pen=pg.mkPen('#FF8C00', width=1))
+        self.zero_phase_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('w', width=1, style=Qt.PenStyle.DashLine))
+        self.plot_iq_phase.addItem(self.zero_phase_line)
+        self.zero_phase_line.setValue(0)
+
         # DSP Gain/Phase Difference display (shown in Q channel plot)
         self.dsp_info_text = pg.TextItem(anchor=(1, 0), color='#00FF00')
         self.dsp_info_text.setPos(0, 0)
@@ -559,7 +569,8 @@ class ADCViewer(QMainWindow):
         plot_grid = QGridLayout()
         plot_grid.addWidget(self.plot_ch1, 0, 0)
         plot_grid.addWidget(self.plot_ch2, 1, 0)
-        plot_grid.addWidget(self.fft_tabs, 0, 1, 2, 1)
+        plot_grid.addWidget(self.plot_iq_phase, 2, 0)
+        plot_grid.addWidget(self.fft_tabs, 0, 1, 3, 1)
         plot_layout.addLayout(plot_grid)
         
         # Status bar
@@ -1242,6 +1253,23 @@ class ADCViewer(QMainWindow):
         
         self.curve_ch1.setData(xs, y1_plot)
         self.curve_ch2.setData(xs, y2_plot)
+        
+        # Compute and display IQ phase = atan2(Q, I) in degrees
+        # Apply DSP correction if active
+        i_phase = y2.copy()
+        q_phase = y1.copy()
+        if abs(self.dsp_gain - 1.0) > 1e-6 or abs(self.dsp_phase) > 1e-6:
+            i_phase, q_phase = self.apply_dsp_correction(i_phase, q_phase)
+        iq_phase_deg = np.degrees(np.arctan2(q_phase, i_phase))
+        # Downsample to match display
+        if len(iq_phase_deg) > self.max_display_points:
+            step = len(iq_phase_deg) // self.max_display_points
+            iq_phase_plot = iq_phase_deg[::step]
+        else:
+            iq_phase_plot = iq_phase_deg
+        self.curve_iq_phase.setData(xs, iq_phase_plot)
+        self.plot_iq_phase.setYRange(-180, 180)
+        self.plot_iq_phase.setXRange(0, float(win))
         
         # Calculate and display mean (using up to 8000 samples)
         n_mean = min(8000, dcount)

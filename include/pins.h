@@ -27,11 +27,11 @@
 
 // DVGA IC 1 parallel mode pins (D0-D5)
 #define DVGA_D0 5
-#define DVGA_D1 37
-#define DVGA_D2 36
+#define DVGA_D1 33
+#define DVGA_D2 34
 #define DVGA_D3 35
-#define DVGA_D4 34
-#define DVGA_D5 33
+#define DVGA_D4 36
+#define DVGA_D5 37
 
 // DVGA IC 2
 #define DVGAI_OE 11
