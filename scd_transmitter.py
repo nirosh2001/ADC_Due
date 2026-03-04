@@ -187,13 +187,19 @@ class SCDTransmitter:
                 logger.error("Failed to encode SCD matrix")
                 return False
             
-            # Create metadata header
+            # Create metadata header with normalization info
+            scd_min = float(np.min(scd_matrix))
+            scd_max = float(np.max(scd_matrix))
+            
             metadata = {
                 "source": "CW",
                 "frame_id": self.frame_counter,
                 "timestamp": datetime.now().isoformat(),
                 "shape": list(scd_matrix.shape),
-                "dtype": str(scd_matrix.dtype)
+                "dtype": str(scd_matrix.dtype),
+                "min_value": scd_min,
+                "max_value": scd_max,
+                "encoding": "png16"
             }
             
             # Serialize metadata to JSON
@@ -237,7 +243,8 @@ class SCDTransmitter:
     
     def _encode_scd_to_png(self, scd_matrix):
         """
-        Encode SCD matrix as PNG image bytes.
+        Encode SCD matrix as colored 16-bit PNG image bytes for higher resolution.
+        Uses turbo colormap for better visualization.
         
         Args:
             scd_matrix (np.ndarray): SCD matrix (2D numpy array)
@@ -249,7 +256,7 @@ class SCDTransmitter:
             # Create a copy to avoid modifying original
             scd = scd_matrix.copy()
             
-            # Normalize to 0-255 range
+            # Normalize to 0-1 range
             scd_min = np.min(scd)
             scd_max = np.max(scd)
             
@@ -258,11 +265,19 @@ class SCDTransmitter:
             else:
                 scd_normalized = np.zeros_like(scd)
             
-            # Convert to uint8
+            # Convert to uint8 for colormap application
             scd_uint8 = (scd_normalized * 255).astype(np.uint8)
             
-            # Encode as PNG (lossless)
-            success, encoded = cv2.imencode('.png', scd_uint8, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            # Apply turbo colormap (BGR format for OpenCV)
+            colored = cv2.applyColorMap(scd_uint8, cv2.COLORMAP_TURBO)
+            
+            # Convert to 16-bit for higher precision
+            # Each channel goes from 8-bit (0-255) to 16-bit (0-65535)
+            colored_16bit = (colored.astype(np.uint16) * 257)  # 257 = 65535/255
+            
+            # Encode as 16-bit color PNG (3 channels, lossless)
+            success, encoded = cv2.imencode('.png', colored_16bit, 
+                                           [cv2.IMWRITE_PNG_COMPRESSION, 3])
             
             if not success:
                 return None

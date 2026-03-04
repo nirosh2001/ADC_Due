@@ -218,21 +218,50 @@ class SCDReceiver:
                     # Convert bytes to numpy array
                     nparr = np.frombuffer(image_bytes, np.uint8)
                     
-                    # Decode PNG
-                    img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+                    # Decode PNG (colored 16-bit, 3 channels BGR)
+                    img = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
                     
                     if img is None:
                         logger.error(f"Failed to decode PNG image (frame {frame_id})")
                         continue
                     
-                    # Save image to disk
+                    # Save colored 16-bit PNG to disk
                     filename = f"{source}_frame_{frame_id}.png"
                     filepath = os.path.join(self.output_folder, filename)
-                    
                     cv2.imwrite(filepath, img)
                     
-                    # Log success
-                    logger.info(f"Received frame {frame_id} from {source}, saved successfully.")
+                    # Also save raw numpy data with denormalization info
+                    if "min_value" in header and "max_value" in header:
+                        # Reconstruct original values from colored data
+                        min_val = header["min_value"]
+                        max_val = header["max_value"]
+                        
+                        # For colored image, average the BGR channels to get intensity
+                        # Then denormalize back to original scale
+                        if len(img.shape) == 3:  # Color image
+                            # Average BGR channels
+                            img_gray = np.mean(img, axis=2).astype(np.float64)
+                        else:  # Grayscale fallback
+                            img_gray = img.astype(np.float64)
+                        
+                        # Denormalize: convert uint16 back to original scale
+                        img_normalized = img_gray / 65535.0
+                        img_original = img_normalized * (max_val - min_val) + min_val
+                        
+                        # Save as compressed numpy file
+                        npz_filename = f"{source}_frame_{frame_id}_raw.npz"
+                        npz_filepath = os.path.join(self.output_folder, npz_filename)
+                        np.savez_compressed(npz_filepath, 
+                                          scd_data=img_original,
+                                          min_value=min_val,
+                                          max_value=max_val,
+                                          shape=shape,
+                                          timestamp=timestamp)
+                    
+                    # Log success with resolution info
+                    bit_depth = "16-bit" if img.dtype == np.uint16 else "8-bit"
+                    channels = "color" if len(img.shape) == 3 else "grayscale"
+                    logger.info(f"Received frame {frame_id} from {source} ({bit_depth} {channels}, {img.shape}), saved successfully.")
                     
                     # Print to console (as required)
                     print(f"Received frame {frame_id} from {source}, saved successfully.")
