@@ -9,6 +9,7 @@ import numpy as np
 import serial
 from scipy.signal import butter, sosfilt
 from gpu_compute import GPUCompute
+from scd_transmitter import SCDTransmitter
 
 # Suppress overflow warnings from pyqtgraph internals
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='pyqtgraph')
@@ -298,6 +299,11 @@ class ADCViewer(QMainWindow):
         self.gpu = GPUCompute()
         self.use_gpu = self.gpu.available  # auto-enable if GPU found
         
+        # SCD Transmitter for Wi-Fi transmission to ML laptop
+        self.scd_transmitter = SCDTransmitter()
+        self.scd_transmitter_host = "192.168.1.100"  # Default ML laptop IP
+        self.scd_transmitter_port = 5000  # Default port
+        
         self.setup_ui()
         self.setup_timer()
     
@@ -541,6 +547,37 @@ class ADCViewer(QMainWindow):
 
         scd_dataset_controls.addStretch()
         scd_layout.addLayout(scd_dataset_controls)
+
+        # SCD Transmission controls (fourth row)
+        scd_transmission_controls = QHBoxLayout()
+        
+        scd_transmission_controls.addWidget(QLabel("ML Laptop IP:"))
+        self.edit_transmitter_ip = QLineEdit()
+        self.edit_transmitter_ip.setPlaceholderText("e.g. 192.168.1.100")
+        self.edit_transmitter_ip.setText(self.scd_transmitter_host)
+        self.edit_transmitter_ip.setMinimumWidth(120)
+        self.edit_transmitter_ip.setToolTip("IP address of ML laptop server")
+        scd_transmission_controls.addWidget(self.edit_transmitter_ip)
+        
+        scd_transmission_controls.addWidget(QLabel("Port:"))
+        self.spin_transmitter_port = QSpinBox()
+        self.spin_transmitter_port.setRange(1024, 65535)
+        self.spin_transmitter_port.setValue(self.scd_transmitter_port)
+        self.spin_transmitter_port.setToolTip("TCP port for server connection")
+        scd_transmission_controls.addWidget(self.spin_transmitter_port)
+        
+        self.btn_transmission_toggle = QPushButton("Enable Transmission")
+        self.btn_transmission_toggle.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 4px 12px;")
+        self.btn_transmission_toggle.clicked.connect(self.toggle_transmission)
+        self.btn_transmission_toggle.setToolTip("Toggle Wi-Fi transmission of SCD frames to ML laptop")
+        scd_transmission_controls.addWidget(self.btn_transmission_toggle)
+        
+        self.lbl_transmission_status = QLabel("Tx: Disconnected")
+        self.lbl_transmission_status.setStyleSheet("font-size: 10px; color: gray; padding: 2px;")
+        scd_transmission_controls.addWidget(self.lbl_transmission_status)
+        
+        scd_transmission_controls.addStretch()
+        scd_layout.addLayout(scd_transmission_controls)
 
         # SCD 2D plot using ImageView
         self.scd_plot = pg.PlotWidget(title="Spectral Correlation Density")
@@ -3211,6 +3248,71 @@ class ADCViewer(QMainWindow):
             f"  • scd_pattern.png (image)\n"
             f"  • settings.txt (all settings)")
 
+    # ========== SCD Transmission ==========
+    
+    def toggle_transmission(self):
+        """Toggle Wi-Fi transmission of SCD frames to ML laptop."""
+        if not self.scd_transmitter.connected:
+            # Not connected - try to connect
+            host = self.edit_transmitter_ip.text().strip()
+            port = self.spin_transmitter_port.value()
+            
+            if not host:
+                QMessageBox.warning(self, "Missing IP Address", "Please enter the ML laptop IP address.")
+                return
+            
+            # Try to connect
+            self.lbl_transmission_status.setText("Tx: Connecting...")
+            self.lbl_transmission_status.setStyleSheet("font-size: 10px; color: orange; padding: 2px;")
+            QApplication.processEvents()  # Update UI
+            
+            success = self.scd_transmitter.connect(host, port, timeout=5)
+            
+            if success:
+                # Connection successful - start transmission
+                self.scd_transmitter.start_transmission()
+                self.btn_transmission_toggle.setText("Disable Transmission")
+                self.btn_transmission_toggle.setStyleSheet("background-color: #FF5722; color: white; font-weight: bold; padding: 4px 12px;")
+                self.lbl_transmission_status.setText(f"Tx: Active → {host}:{port}")
+                self.lbl_transmission_status.setStyleSheet("font-size: 10px; color: #4CAF50; padding: 2px;")
+                
+                # Store the host and port
+                self.scd_transmitter_host = host
+                self.scd_transmitter_port = port
+                
+                QMessageBox.information(self, "Transmission Started",
+                    f"Successfully connected to ML laptop at {host}:{port}\n\n"
+                    f"SCD frames will be transmitted automatically when generated.")
+            else:
+                # Connection failed
+                self.lbl_transmission_status.setText("Tx: Connection Failed")
+                self.lbl_transmission_status.setStyleSheet("font-size: 10px; color: red; padding: 2px;")
+                QMessageBox.warning(self, "Connection Failed",
+                    f"Failed to connect to {host}:{port}\n\n"
+                    f"Please check:\n"
+                    f"  • ML laptop is powered on\n"
+                    f"  • Server is running on ML laptop\n"
+                    f"  • IP address and port are correct\n"
+                    f"  • Both devices are on same Wi-Fi network")
+        else:
+            # Already connected - toggle transmission
+            if self.scd_transmitter.is_enabled():
+                # Disable transmission (but keep connection)
+                self.scd_transmitter.stop_transmission()
+                self.btn_transmission_toggle.setText("Enable Transmission")
+                self.btn_transmission_toggle.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 4px 12px;")
+                status = self.scd_transmitter.get_status()
+                self.lbl_transmission_status.setText(f"Tx: Paused ({status['frames_sent']} sent)")
+                self.lbl_transmission_status.setStyleSheet("font-size: 10px; color: orange; padding: 2px;")
+            else:
+                # Enable transmission
+                self.scd_transmitter.start_transmission()
+                self.btn_transmission_toggle.setText("Disable Transmission")
+                self.btn_transmission_toggle.setStyleSheet("background-color: #FF5722; color: white; font-weight: bold; padding: 4px 12px;")
+                status = self.scd_transmitter.get_status()
+                self.lbl_transmission_status.setText(f"Tx: Active → {status['host']}:{status['port']}")
+                self.lbl_transmission_status.setStyleSheet("font-size: 10px; color: #4CAF50; padding: 2px;")
+
     # ========== Spectral Correlation Density (SCD) ==========
     
     def on_scd_enable_toggled(self, state):
@@ -3475,6 +3577,21 @@ class ADCViewer(QMainWindow):
         self.scd_data = scd_db
         self.scd_raw_i = i_data.copy()
         self.scd_raw_q = q_data.copy()
+        
+        # Send SCD frame via Wi-Fi if transmission is enabled
+        if self.scd_transmitter.is_enabled():
+            success = self.scd_transmitter.send_scd_frame(scd_db)
+            if success:
+                # Update transmission status with frame count
+                status = self.scd_transmitter.get_status()
+                self.lbl_transmission_status.setText(f"Tx: Active ({status['frames_sent']} sent)")
+            else:
+                # Transmission failed - update status
+                self.lbl_transmission_status.setText("Tx: Send Failed")
+                self.lbl_transmission_status.setStyleSheet("font-size: 10px; color: red; padding: 2px;")
+                # Reset button state
+                self.btn_transmission_toggle.setText("Enable Transmission")
+                self.btn_transmission_toggle.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 4px 12px;")
     
     def compute_iq_gain_phase_diff(self, i_data, q_data, fft_n=4096):
         """Compute gain ratio and phase difference between I and Q channels.
